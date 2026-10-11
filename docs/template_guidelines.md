@@ -1,27 +1,113 @@
 # 大模型算法实战教程题目与网页化模板指南
 
-为了保证整个项目在源码（Jupyter Notebook）和前端网页（VitePress）上的展示一致性、防剧透体验以及低维护成本，所有题目请严格遵循以下结构与模板规范。
+为了保证整个项目在源码（Jupyter Notebook）和前端网页（VitePress）上的展示一致性、防剧透体验以及低维护成本，所有题目请遵循以下结构与模板规范。
+
+写作目标是两件事同时成立：**像教材一样娓娓道来**（先讲痛点和直觉，带具体数字和例子），**又像工具书一样能快速定位**（每节末尾一张速查卡，对比表折叠起来随时可查）。术语写法见 [术语表与中英文写作规范](./terminology.md)，口吻要求见 [维护手册 · 受众与写作口径](./maintenance.md#受众与写作口径)。
 
 ## 一、 源码规范：Jupyter Notebook (`.ipynb`) 结构
 
 每一个题目的 Notebook 必须采用 **"SSOT (Source of Truth)"** 原则：所有的题目、测试用例、解析和答案都写在同一个 `.ipynb` 文件中。
 
-### 标准文件结构
-1. **【题目区】(Markdown + Code)**
-   - 介绍核心概念。
-   - 给出填空代码（使用 `TODO` 占位符）。
-2. **【测试区】(Code)**
-   - 提供 `test_xxx()` 函数，用以验证用户填入的代码正确性以及输出性能（如有）。
-3. **【防剧透缓冲带】(Markdown)**
-   - **必须**放置在测试代码块之后，答案块之前。用于在 Colab 或本地执行时防止用户不小心往下滚看到答案。
-4. **【解析与答案区】(Markdown + Code)**
-   - 提供详细的思路和无 Bug 的满分代码。
+### 机制 Notebook 单元模板（v2）
 
-### 尾部三段式模板代码
+下表中 **A** 标记的字符串和 tag 被转换脚本或测试脚本依赖，必须原样保留；其余内容自由写作。参照实现：`02_PyTorch_Algorithms/21_Decoding_Strategies.ipynb`。
 
-在 Notebook 的最末尾，请依次添加以下三个 Cell：
+| # | Cell | 锚点 | 写什么 |
+|---|---|---|---|
+| 0 | 标题 + 导读 | **A** 第 1 行 `# NN. English Title \| 中文标题`（ASCII ` \| `，`tools/convert_notebook.py` 只识别这个分隔符）；含 `**难度：**` 的行是 Colab 徽章插入点 | `**难度：** … \| **环境：** … \| **标签：** …`，然后 `## 本节导读`：两段正文，第二段以"学完后你能…"收尾。英文术语在这里首次括注 |
+| 1 | `## 前置阅读` | **A** | ≤3 个链接，每个一句话说"为什么要先看" |
+| 2 | `### Step 1：痛点与直觉` | **A** `### Step 1` | 见下方规格。**不放表格**。正文之后可放一张 SVG |
+| 3 | `### Step 2：机制怎么走` | | 带具体数字的微型例子（5 词词表、K=3、p=0.85…），用正文或有序列表走一遍；末尾可放一个**折叠**的速查表 |
+| 4 | `### Step 3：边界与陷阱` | | 讲清一个微妙点（边界 token、草稿概率为 0、第 K 名并列…），用对/错两个例子；折叠表可选 |
+| 5 | `### Step 4：任务` | **A** `### Step 4`；TODO 表必须是该 cell 中第一个每行以 `TODO n` 开头的表 | 1–2 句定向，然后 TODO 表（可见、不折叠）。表头措辞自由，第 1 列写 `TODO n · \`func\``；行集合必须与题目区 TODO 编号一致（`tools/check_mechanism_step4_tables.py`） |
+| 6 | imports | **A** tag `tutorial-imports` | |
+| 7 | 题目 | **A** tag `tutorial-question`；每个 TODO 以 `raise NotImplementedError("TODO n：…")` 结尾 | TODO 注释说"算什么、提示哪一行" |
+| 8 | `### 测试` | | 每个测试一句大白话（"测试 3 检查边界 token 没被误删"） |
+| 9 | 测试 | **A** tag `tutorial-test` | |
+| 10 | 防剧透缓冲带 | **A** 含 `STOP HERE` | 见下方模板 |
+| 11 | `## 参考代码与解析` + `### 代码` | **A** | |
+| 12 | 答案 | **A** tag `tutorial-answer` | |
+| 13 | `### 解析` | **A** | 四段式：思路 → 关键一行 → 为什么这样写 → 常见错法（见下） |
+| 14… | Step 5 GPU 实验（若有） | tags `tutorial-gpu-*` + `skip_answer_test` | 结构见 [维护手册](./maintenance.md#part02-非项目小节的可选-gpu-实验模板)；5.1 开头用一段正文说明 GPU 实验能证明什么、不能证明什么；配置表和结果表不折叠 |
+| n-1 | `## 速查卡` | **A** `<a id="cheatsheet"></a>` + `## 速查卡` | 固定骨架（见下）。放在相关阅读**之前** |
+| n | `## 相关阅读` | **A** | 只放论文/官方文档，每条加 5–10 字"读什么" |
 
-**Cell 1: 防剧透缓冲带 (Markdown)**
+兼容性约束：除 cell 10 外，任何 Markdown 不得包含 `STOP HERE`；除 cell 11 外不得包含 `参考代码与解析`（`tools/test_notebook_answers.py` 在无 tag 的旧 Notebook 上靠这两个字符串定位题目区与答案区）。
+
+### Step 1「痛点与直觉」规格
+
+- 图片之前用约 150–400 个汉字讲清问题，零表格；复杂机制可适当延长，不为凑字数重复导读。
+- 四个节拍按顺序写：
+  1. 带至少一个数字的具体场景（"Qwen2.5 词表 151,936 个 token，模型每步吐出 151,936 个分数"）；
+  2. 朴素做法，以及它具体痛在哪里；
+  3. 核心想法，用一个类比，或一句以"比如 / 想象 / 换个说法"开头的话；
+  4. 本节要动手做什么。
+- 语气参照：`01_Hardware_Math_and_Systems/02_LLM_Params_and_FLOPs.ipynb` 的"实战估算"、`11_KV_Cache_and_Memory_Growth.ipynb` 的 Q1 末段、`03_Triton_Kernels/03_Triton_Fused_RMSNorm.ipynb` 的 Step 1。
+
+例子中的数字须能复算；假设数字标明为假设，实测数字注明模型、配置和记录。用类比建立直觉后，要说明类比没有覆盖的算法条件。简化练习与论文实现不同的地方应明确写出，不能用 CPU 正确性测试推出 GPU 加速。
+
+词频、表格比例和篇幅用于辅助审阅，不设“每节必须出现几次比如”之类的门槛。验收时检查读者能否说明因果、复算例子、找到实现和边界。
+
+### 折叠与速查卡
+
+**折叠**用 HTML `<details>`，Jupyter、Colab 和 VitePress 三端都能渲染（VitePress 的 `::: details` 在 Jupyter 里会显示为原始文本，不要用）：
+
+```markdown
+<details>
+<summary>速查表：temperature / top-k / top-p 对比</summary>
+
+| 路径 | 改什么 | 不改什么 |
+|---|---|---|
+| … | … | … |
+
+</details>
+```
+
+- `<summary>` 内是裸 HTML，不能放反引号或 Markdown。
+- `</summary>` 之后、`</details>` 之前**必须空一行**，否则表格会被当成 HTML 文本原样输出。
+- 折叠正文里避免连续两个左花括号（Vue 会当成插值表达式）和紧跟字母的小于号（会被当成 HTML 标签）；写 `T < 1` 或 `$T<1$`。
+- 折叠对象：概念对比表（阶段/输入/输出、候选来源比较、Step 5 的"学习问题 \| CPU 已确认 \| GPU 要确认"）。放在所属 Step 正文**之后**。
+- 不折叠：Step 4 的 TODO 表、Step 5 的配置表和结果表、速查卡本身。
+
+**速查卡**固定为 4 行 2 列，放在相关阅读之前：
+
+```markdown
+<a id="cheatsheet"></a>
+## 速查卡
+
+| | |
+|:--|:--|
+| **一句话机制** | … |
+| **关键公式与数量级** | … |
+| **常见坑** | 1. … 2. … 3. … |
+| **延伸阅读** | 专题正文：[…](../topic_discussion/…) · 判断手册：[…](../topic_discussion/…/casebook.md#…) · 下一步：[NN](./NN_….ipynb) |
+```
+
+`<a id="cheatsheet">` 让专题层的索引可以用 `…ipynb#cheatsheet` 直接跳到速查卡；转换脚本会把它改写成 `…md#cheatsheet`。
+
+### 解析四段式
+
+每个 TODO 一节，按"思路 → 关键一行 → 为什么这样写 → 常见错法"展开。不要写成"机制 / 不变量 / 测试证据"的三行清单。
+
+````markdown
+#### TODO 2：prefill 一次性分块
+
+**思路：** 一个 prompt 有 `seq_len` 个 token，每个 block 装 `block_size` 个，先算要几块，再一次拿够。
+
+**关键一行：**
+```python
+needed_blocks = (req.seq_len + self.block_size - 1) // self.block_size
+```
+
+**为什么这样写：** 整数向上取整。比如 `seq_len=17, block_size=16`：`17 // 16 = 1` 会丢掉第 17 个 token，`(17 + 15) // 16 = 2` 才对。不用 `math.ceil(a / b)` 是避免引入 float。
+
+**常见错法：** 先 `pop` 几个 block 再发现不够、抛 OOM——此时 `free_blocks` 已经少了，请求却没拿到块。测试 `test_prefill_oom_is_atomic` 抓的就是这一点。
+````
+
+### 防剧透缓冲带模板
+
+放在测试代码块之后、答案块之前，防止在 Colab 或本地执行时不小心往下滚看到答案：
+
 ```markdown
 ---
 
@@ -34,24 +120,9 @@
 ---
 ```
 
-**Cell 2: 答案文字解析 (Markdown)**
-*(注意：标题中必须包含 `解析`、`答案` 或 `参考代码` 关键词，以便转换脚本触发折叠！)*
-```markdown
-## 官方解析与参考代码
+### 参考代码命名
 
-**解析：**
-1. **TODO 1 (命名/目标)：** [解释第一步的思路...]
-2. **TODO 2 (防溢出/加速等)：** [解释工程实现中的细节，如强转 float32，避免 nan 等...]
-3. **复杂度与带宽：** [可选：分析 FLOPs 和访存带宽瓶颈...]
-```
-
-**Cell 3: 完整参考代码 (Code)**
-```python
-# 建议命名带有 Solution 后缀，避免和上面的 TODO 模板类名冲突
-class RMSNormSolution(nn.Module):
-    def __init__(self, ...):
-        ...
-```
+答案 cell 中的类建议带 `Solution` 后缀（如 `RMSNormSolution`），避免和题目区的 TODO 模板类名冲突。
 
 ---
 
@@ -139,7 +210,7 @@ Decision 类项目通常不重新训练或测量 GPU；它读取已有报告执�
 - `Project + Analysis` 表示项目产物之外，还要解释数据或训练现象，例如 64。
 - `Decision + Benchmark` 表示先产生对照数据，再根据约束进行方案选择，例如 65。
 - 不要把项目类型与运行环境混用：项目类型表示主要产出；运行环境同时说明硬件、运行方式和依赖配置。
-- Step1 只定义问题、输入、操作、输出和证据边界；具体 TODO、测试区和解析区分别在后续 Step 展开。
+- 机制 Notebook 的 Step 1 先讲痛点与直觉（≥150 字叙述，不放表格），对比表折叠在 Step 2/3 正文之后；项目 Notebook 的 Step 1 可以直接用上面的实验约定表，但表格之前先用一段话说清这个项目要回答什么问题。
 
 ## 三、网页化转换规范：转换脚本逻辑 (`tools/convert_notebook.py`)
 
@@ -152,19 +223,20 @@ Decision 类项目通常不重新训练或测量 GPU；它读取已有报告执�
 
 ### 转换脚本当期支持的特性：
 1. **自动生成云端运行徽章 (Hero Badges)**
-   - 脚本会在每一页的最上方自动植入 "Open In Colab" 和 "Open In ModelScope" (魔搭) 徽章。
+   - 脚本会在每一页的最上方自动植入 "Open In Colab" 和 "Open In ModelScope" (魔搭) 徽章，插入点是首个 cell 中含 `**难度：**` 的那一行之后。
    - 自动映射 GitHub 源码路径，确保一键跳转。
-2. **智能识别并折叠答案 (Smart Folding)**
-   - 脚本扫描 Markdown Cell 的文本，一旦匹配到 `答案`、`解析` 或 `solution` 关键词，会自动注入 VitePress 的 `::: details 💡 点击查看官方解析与参考代码` 容器。
-   - 将这之后的解析文字和答案代码块全部包裹并默认折叠。
-3. **评论区与 PR 引导 (Community CTA)**
-   - 在每篇文章的底部，脚本会自动追加引导提交 PR 的 Markdown 块。
-   - VitePress 底部自动挂载配置好的 GitHub Giscus 讨论区组件。
+2. **标题归一与链接改写**
+   - 首个 cell 的 H1 会被重写为 `# NN. English Title | 中文标题`，英文部分取自文件名；中文部分取自原 H1 中 ASCII ` | ` 之后的内容（全角 `｜` 不会被识别）。
+   - `.ipynb)` 和 `.ipynb#锚点)` 形式的链接会改写为 `.md)` / `.md#锚点)`；`../docs/` 前缀改写为 `../`。
+3. **Markdown 原样透传**
+   - 其余 Markdown cell 原样拼接，代码 cell 包成 ```` ```python ```` 代码块。脚本**不会**自动折叠答案；折叠靠 Notebook 内手写的 `<details>`（见上文）。
+   - 页面底部的 Giscus 评论区由 VitePress 主题（`docs/.vitepress/theme/index.mts`）挂载，与转换脚本无关。
 
 ## 四、维护者的日常工作流
 
-1. **出题/修改代码**：只在根目录下的相应目录（如 `02_PyTorch_Algorithms/`）打开或新建 `.ipynb`，按照上文的“尾部三段式”模板编写题目和答案。
+1. **出题/修改代码**：只在根目录下的相应目录（如 `02_PyTorch_Algorithms/`）打开或新建 `.ipynb`，按照上文的单元模板编写题目、解析和速查卡。
 2. **生成网页**：
-   - 统一运行 `python tools/convert_notebook.py`
-3. **预览校验**：进入 `docs/` 运行 `npm run docs:preview` 查看网页排版是否完美。
+   - 统一运行 `python tools/convert_notebook.py`（单个文件用 `--file <path>`）
+   - 专题正文或组页改动后另跑 `python tools/sync_docs_navigation.py`
+3. **预览校验**：进入 `docs/` 运行 `npm run docs:preview` 查看网页排版是否完美；重点看折叠表能否展开、速查卡锚点能否跳转。
 4. **提交代码**：`git add` 修改过的 `.ipynb` 和 `docs/` 下的 `.md`，然后 `git commit` & `git push`。

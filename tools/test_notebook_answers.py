@@ -283,7 +283,7 @@ def test_notebook_answers(notebook_path, test_mode='answer'):
 
     try:
         result = subprocess.run(
-            ['python', temp_path],
+            [sys.executable, temp_path],
             capture_output=True,
             text=True,
             timeout=30

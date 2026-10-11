@@ -1,5 +1,6 @@
 # 35. Multi Token Decoding | 原生多 Token 预测
-**难度：** Hard | **环境：** CPU-first | **标签：** `推理优化`, `投机解码`, `MTP` | **目标人群：** 推理优化学习者
+
+**难度：** Hard | **环境：** CPU + GPU | **标签：** `推理优化`, `投机解码`, `MTP`
 
 > 🚀 **云端运行环境**
 >
@@ -9,272 +10,218 @@
 > [![Open In Studio](https://img.shields.io/badge/Open%20In-ModelScope-blueviolet?logo=alibabacloud)](https://modelscope.cn/my/mynotebook) *(国内推荐：魔搭社区免费实例)*
 
 
----
-
 ## 本节导读
 
-经典投机解码由独立草稿模型提出候选；原生 Multi-Token Prediction（MTP）则把多个未来 token 的预测头或层放在目标模型内部。它减少了独立 draft checkpoint 的配对成本，但只有原生带有 MTP 模块的模型才能直接使用这条路径。
+23 节的投机解码要额外养一个 draft model（草稿模型）：多一份权重、多一份 KV Cache、tokenizer 还得对得上，而且一个通用小模型和大模型的"口味"未必一致，接受率上不去。MTP（multi-token prediction，多 token 预测）换了个思路：**把草稿能力做进模型自身**。checkpoint 里多带一两个很轻的预测模块，它们复用主模型刚算好的隐藏状态，顺手猜出再往后一两个 token；主模型下一次前向时把这些候选一并验证。DeepSeek-V3 和 Qwen3.5 系列都带这样的模块。
 
-本节聚焦原生 MTP 的候选形成、连续接受、首次拒绝和回退。EAGLE 的外置特征草稿器以及 DFlash / DSpark 的并行草稿拓扑分别由独立机制页承载，避免把不同候选来源混成一种实现。
+本节实现这条路径的三个关节：从各预测深度的 logits 形成有序候选块、按位置和主模型结果做贪心验证、在首次不匹配处修正并停止。学完后你能解释 MTP 和外置 draft model 在"候选从哪来"上的本质区别、为什么贪心下"候选 == argmax"就足够无损，以及 vLLM 启用 MTP 时为什么必须先确认 checkpoint 里真有这些层。
 
-**关键词：** `multi-token decoding`, `speculative decoding`, `verification`, `rollback`
 ## 前置阅读
 
-**导语：** 先理解单 token 解码怎样更新状态，以及投机验证怎样按位置推进；再观察一次请求如何在一轮中处理多个候选 token。
-- [21. Decoding Strategies | 解码策略](./21_Decoding_Strategies.md)
-- [23. Speculative Decoding | 投机解码](./23_Speculative_Decoding.md)
+- [Part 02 · 21 解码策略](./21_Decoding_Strategies.md) —— 本节的候选就是各深度 logits 的 argmax，验证也只看 argmax；先熟悉 logits → token 这一步。
+- [Part 02 · 23 投机解码](./23_Speculative_Decoding.md) —— draft / verify / 首次拒绝即停 / bonus token 的循环骨架在这里不变，变的只是"draft 从哪来"。
+
+### Step 1：痛点与直觉——草稿不用另请一个模型
+
+想象你已经按 23 节的办法给一个 70B 模型配了个 7B 的 draft。好处是真的，麻烦也是真的：7B 的 BF16 权重就是 14 GB 显存，它自己的 KV Cache 也要占地方；本节的直接 token-ID 验证路径要求两个模型使用兼容的 tokenizer；最关键的是，7B 模型是独立训练的，它对"下一个词"的判断和 70B 经常不一致，例如在一个假设场景中，每轮猜 5 个却平均只收下两三个，而 draft 自己跑 5 步的时间已经花出去了。
+
+MTP 的观察是：主模型算完位置 $t$ 之后，最后一层的隐藏状态里其实已经携带了关于 $t+1$、$t+2$ 的大量信息——否则它怎么能准确预测 $t+1$？那就别浪费：在模型末尾挂一个很轻的模块（DeepSeek-V3 里是一个 Transformer block 加共享的输出头），输入是这个隐藏状态拼上刚选出来的 $t+1$ token 的 embedding，输出 $t+2$ 的 logits；要猜更远就再串一个模块。这些模块和主模型一起训练，看的是同一份表示，有机会更好地拟合主模型的分布，但并不保证接受——DeepSeek-V3 论文报告第二个 token 的接受率在 85%–90%，解码吞吐约 1.8×。换个说法，这不是请一个实习生来打草稿，而是作者自己写完一个词时顺手在页边记下接下来想写的词，下一句落笔前瞄一眼就行。
+
+代价是每多猜一个 token 只多算一个轻量 block，而不是再跑一个几 B 的模型；但本节练习只使用传入的各深度 logits，候选数不能超过这些行数。真实 backend 有时会递推复用 MTP 模块，因此候选步数不必等于 MTP 层数；能否这样运行要查模型与 backend 的具体支持。
+
+本节你要实现的是推理侧的三步：从各深度 logits 选出候选块、和主模型的 argmax 逐位比对算出连续接受长度、在首次不匹配处用主模型的 token 修正并结束本轮。
+
+<img src="../public/02_PyTorch_Algorithms/35_multi_token_overview.svg" alt="原生 MTP 与投机解码机制链" width="1440" height="650">
+
+### Step 2：机制怎么走——3 个深度、3 个词的例子
+
+把词表缩到 3 个 token，假设我们已经获得 3 个有序预测位置的 logits（这里不实现生成这些 logits 的模型）。主模型算完当前位置后，三个深度各给出一行 logits：
+
+```
+depth 1: [0.1, 0.9, 0.0]   → argmax = 1
+depth 2: [0.8, 0.1, 0.1]   → argmax = 0
+depth 3: [0.2, 0.3, 0.5]   → argmax = 2
+```
+
+**形成候选块.** 每个深度各取 argmax，按深度顺序排好：`[1, 0, 2]`。如果本轮预算 `max_candidates=2`，只取前两个 `[1, 0]`——深度 3 的候选扔掉，不是重选。顺序不能动：深度 1 对应紧接着的下一个位置，深度 2 对应再下一个，位置和深度一一绑定。
+
+**验证.** 主模型下一次前向把这 $K$ 个候选当作输入一并算，得到 $K+1$ 个位置上它自己的 argmax（多出来的那个是全部接受时的 bonus 位置）。换一组数字看：候选 `[4, 5, 6]`，主模型给出 `[4, 5, 9, 8]`。从左到右比：4 = 4 ✓，5 = 5 ✓，6 ≠ 9 ✗，停。连续接受长度 2。
+
+**本轮输出.** 接受的前缀 `[4, 5]` 加上主模型在不匹配位置给的 token 9，输出 `[4, 5, 9]`，共 3 个 token，一次主模型前向推进了 3 步。候选 6 以及它后面的（如果有）全部作废。如果候选是 `[4, 5]` 而主模型给 `[4, 5, 8]`，两个全中，输出 `[4, 5, 8]`——最后那个 8 就是 bonus，白送的。
+
+**为什么贪心下这样就够了.** 23 节的接受规则是 $\min(1, p/q)$，因为那里 target 在采样。本节走贪心：主模型无论如何都会输出它的 argmax，候选恰好等于 argmax 就等价于"主模型自己也会选它"，不等就按主模型的来——在 target 数值计算与并列取值规则一致的前提下，结果和逐 token 贪心生成相同。不需要概率，不需要掷硬币。
+
+<details>
+<summary>速查表：MTP 与外置 draft model 的对照</summary>
+
+| | 外置 draft model（23 节） | 原生 MTP（本节） |
+|---|---|---|
+| 候选从哪来 | 独立的小模型自回归跑 $K$ 步 | checkpoint 内的 MTP 模块，复用主模型隐藏状态 |
+| 额外显存 | 小模型权重 + 它的 KV Cache | 几个轻量 block 的权重 |
+| 候选上限 | 由运行预算和实现限制共同决定 | 本题受输入深度数限制；真实 backend 可能递推复用模块 |
+| 口味一致性 | 独立训练，接受率看配对 | 联合训练可改善分布匹配，仍需测量接受情况 |
+| 验证规则 | 采样：$\min(1, p/q)$ + residual | 贪心：候选 == argmax；采样时仍需 23 节的规则 |
+| 一轮推进 | $1 \sim K+1$ 个 token | $1 \sim K+1$ 个 token |
+
+</details>
+
+### Step 3：边界与陷阱——接受长度不是加速比
+
+**陷阱一：候选块长不等于推进量.** 预算 $K = 3$ 只说明最多试 3 个位置。真正能提交的是**连续**接受长度：`[4, 5, 6]` 对 `[4, 5, 9, 8]` 接受 2 个，但 `[4, 7, 6]` 对 `[4, 5, 6, 8]` 只接受 1 个——哪怕第三个候选 6 碰巧和主模型一致，它前面的 7 已经错了，6 是在"7 之后"这个错误前提下猜的，不能算。首次不匹配越靠前，后面的候选越是白算。
+
+**陷阱二：接受长度高也不等于提速.** 每轮多推进的 token 要用 MTP 模块的额外计算、更长的验证前向和 backend 调度开销来换。一个极端例子：如果 MTP 模块本身很慢、或者 batch 很大导致验证前向不再是"白送"，接受率 90% 也可能净收益为负。本节 CPU 部分只算接受长度，不算时间；时间要到 Step 5 和 [INF-PROPOSAL](./INF-PROPOSAL_Dynamic_Proposal_and_Verification_Budget.md) 里看。
+
+**陷阱三：贪心验证用在了采样上.** 如果主路径开了 temperature / top-p 采样，"候选 == argmax"就不再无损——主模型自己采样也不一定选 argmax。这时必须换回 23 节的概率规则。vLLM 等 backend 会根据 `SamplingParams` 自动切换，手写时别混。
+
+**陷阱四：把 MTP 层数直接当成通用候选上限。** 本节 CPU 函数只能返回已有 logits 行中的候选；GPU 示例选择 MTP-1，并记录 Qwen3.5-0.8B 配置含 1 个 MTP 层。这不意味着所有 backend 的多步复用都不成立。增加 `SPECULATIVE_TOKENS` 前，要确认对应模型和 backend 是否支持递推、怎样维护状态，再验证输出与性能。
+
+<img src="../public/02_PyTorch_Algorithms/35_acceptance_budget.svg" alt="多 Token 解码的接受长度与收益" width="1320" height="600">
+
+### Step 4：任务——实现候选形成与贪心验证
+
+题目区已经写好输入校验和返回字典的字段，你要补的是 Step 2 走过的三步。
+
+| TODO | 要做什么 | 必须满足 | 对应测试 |
+| --- | --- | --- | --- |
+| TODO 1 · `select_mtp_candidates` | 每个深度取 argmax，按深度顺序排列，截到 `max_candidates` | 顺序不变；截断是"丢后面的"，不是重选 | `test_select_mtp_candidates`：预算 2 得 `[1, 0]`，预算 8 得 `[1, 0, 2]` |
+| TODO 2 · `continuous_match_length` | 逐位比较候选与主模型 token，首次不同即停 | 返回连续前缀长度 | `test_continuous_match_length`：`[4,5,6]` vs `[4,5,9,8]` → 2；首位就错 → 0 |
+| TODO 3 · `build_mtp_round` | 输出 = 接受前缀 + `target_tokens[accepted_length]` | 不匹配时那个 token 是修正，全中时是 bonus；后缀不进输出 | `test_build_mtp_round`：`[4,5,9]`、`[4,5,8]` |
+
+
+```python
+from typing import List, Sequence
+import torch
+
+```
+
+
+
+```python
+def _validate_depth_logits(depth_logits: torch.Tensor) -> torch.Tensor:
+    """校验 MTP 预测深度与词表维度。"""
+    scores = torch.as_tensor(depth_logits)
+    if scores.ndim != 2 or scores.shape[0] == 0 or scores.shape[1] == 0:
+        raise ValueError("depth_logits 必须是非空二维张量 [depth, vocab]")
+    if not torch.isfinite(scores).all():
+        raise ValueError("词表分数不能包含 NaN 或 Inf")
+    return scores
+
+
+def select_mtp_candidates(depth_logits: torch.Tensor, max_candidates: int) -> List[int]:
+    """按预测深度形成受预算约束的有序候选块。"""
+    scores = _validate_depth_logits(depth_logits)
+    if not isinstance(max_candidates, int) or isinstance(max_candidates, bool) or max_candidates < 1:
+        raise ValueError("max_candidates 必须是正整数")
+    # ==========================================
+    # TODO 1：从各预测深度形成有序候选块。
+    # ==========================================
+    # candidates = ???  # 各深度最高分 Token，长度不超过 max_candidates。
+    raise NotImplementedError("TODO 1：请形成 MTP 候选块")
+    return candidates
+
+
+def continuous_match_length(
+    candidates: Sequence[int],
+    target_tokens: Sequence[int],
+) -> int:
+    """返回候选与目标结果从首位置开始连续匹配的长度。"""
+    if len(target_tokens) < len(candidates):
+        raise ValueError("目标结果必须覆盖所有候选位置")
+    accepted_length = 0
+    for candidate, target in zip(candidates, target_tokens):
+        # ==========================================
+        # TODO 2：在首次不匹配位置停止连续接受。
+        # ==========================================
+        # matches = ???  # 当前 MTP 候选与目标首选 Token 相同时为 True。
+        raise NotImplementedError("TODO 2：请比较当前位置")
+        if not matches:
+            break
+        accepted_length += 1
+    return accepted_length
+
+
+def build_mtp_round(candidates: Sequence[int], target_tokens: Sequence[int]) -> dict:
+    """根据连续匹配边界形成本轮输出和下一轮状态。"""
+    if len(target_tokens) != len(candidates) + 1:
+        raise ValueError("目标结果必须包含候选位置和一个额外位置")
+    accepted_length = continuous_match_length(candidates, target_tokens)
+    # ==========================================
+    # TODO 3：提交接受前缀，并追加修正或额外目标 Token。
+    # ==========================================
+    # emitted_tokens = ???  # 接受前缀后追加 target_tokens[accepted_length]。
+    # all_candidates_accepted = ???  # 接受长度等于候选长度时为 True。
+    raise NotImplementedError("TODO 3：请形成本轮输出")
+    return {
+        "candidate_count": len(candidates),
+        "accepted_length": accepted_length,
+        "emitted_tokens": emitted_tokens,
+        "all_candidates_accepted": all_candidates_accepted,
+        "first_mismatch": None if all_candidates_accepted else accepted_length,
+    }
+
+```
+
+
+### 测试
+
+`test_select_mtp_candidates` 用 3 深度 × 3 词表的 logits 看候选顺序和预算截断，并确认空输入、一维输入会被拒绝；`test_continuous_match_length` 覆盖中途不匹配、首位不匹配、全部匹配三种情况；`test_build_mtp_round` 检查修正路径和 bonus 路径各自的输出以及 `first_mismatch` 字段。
+
+
+```python
+def test_select_mtp_candidates():
+    """候选应按预测深度排列，并受最大候选数限制。"""
+    logits = torch.tensor([[0.1, 0.9, 0.0], [0.8, 0.1, 0.1], [0.2, 0.3, 0.5]])
+    assert select_mtp_candidates(logits, 2) == [1, 0]
+    assert select_mtp_candidates(logits, 8) == [1, 0, 2]
+    for invalid in (torch.empty(0, 3), torch.tensor([0.1, 0.9])):
+        try:
+            select_mtp_candidates(invalid, 2)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("空输入或非二维输入应失败")
+
+
+def test_continuous_match_length():
+    """连续匹配必须在首个不同位置停止。"""
+    assert continuous_match_length([4, 5, 6], [4, 5, 9, 8]) == 2
+    assert continuous_match_length([4, 5], [9, 5, 8]) == 0
+    assert continuous_match_length([4, 5], [4, 5, 8]) == 2
+
+
+def test_build_mtp_round():
+    """中途不匹配使用目标修正，全部匹配使用额外目标 Token。"""
+    rejected = build_mtp_round([4, 5, 6], [4, 5, 9, 8])
+    assert rejected == {
+        "candidate_count": 3,
+        "accepted_length": 2,
+        "emitted_tokens": [4, 5, 9],
+        "all_candidates_accepted": False,
+        "first_mismatch": 2,
+    }
+    accepted = build_mtp_round([4, 5], [4, 5, 8])
+    assert accepted["emitted_tokens"] == [4, 5, 8]
+    assert accepted["all_candidates_accepted"] is True
+    assert accepted["first_mismatch"] is None
+
+
+test_select_mtp_candidates()
+test_continuous_match_length()
+test_build_mtp_round()
+print("✅ 原生 MTP 候选与贪心验证测试通过")
+
+```
+
 
 ---
 
-### Step 1: 原生 MTP 在投机策略谱系中的位置
+🛑 **STOP HERE** 🛑
+<br><br><br><br><br><br><br><br><br><br>
+> 请先尝试自己完成代码并跑通测试。<br>
+> 如果遇到困难，再向下查看参考代码与解析。
+<br><br><br><br><br><br><br><br><br><br>
 
-原生 MTP 与经典投机解码共享“提出候选 → 目标模型验证 → 接受或回退”的主线，区别在于候选由目标模型 checkpoint 内部的多 Token 预测模块产生。放回 Task2 看，21 提供 Decode 基础，23 解释精确验证语义，本节解释原生 MTP 候选和连续前缀，68 再用匹配的模型与 backend 判断真实收益。
-
-一次验证先由原生 MTP 模块形成候选序列，再从左到右确认可接受的连续前缀。前缀越长，单轮有效推进越多；较早发生拒绝时，后续候选不能直接沿用，需要回退并进入下一轮。模型没有原生 MTP 层时，不能仅靠配置参数凭空启用该路径。
-
-图中上方区分候选产生方式，下方展开本节共享的执行闭环：候选形成后进入目标模型验证，再根据接受前缀或首次拒绝更新解码状态；状态随后反馈到下一轮候选形成。
-
-| 路径 | 候选如何产生 | 验证后的状态 | 本节关注点 |
-|---|---|---|---|
-| 经典投机解码 | 独立草稿模型提出候选 | 概率接受、residual correction 或 bonus | 经典投机语义，详见 [23](./23_Speculative_Decoding.md) |
-| 原生 MTP | verifier checkpoint 内部的多 Token 预测层 | 连续接受前缀、首次拒绝和回退 | 本节的核心机制 |
-| EAGLE | 外置轻量草稿器复用目标隐藏表示 | 候选树与目标验证 | [INF-EAGLE](./INF-EAGLE_Feature_Drafter_and_Candidate_Tree.md) |
-| DFlash / DSpark | 块并行草稿与置信度调度 | 并行候选、块内依赖与预算 | [INF-PARALLEL-DRAFTING](./INF-PARALLEL-DRAFTING_DFlash_and_DSpark.md) |
-| 项目验证 | 在统一 workload 下比较候选、验证与服务结果 | acceptance、质量、成本和端到端收益 | 由 [68](./68_Speculative_Decoding_Benchmark.md) 收口 |
-
-![原生 MTP 与投机解码机制链](../public/02_PyTorch_Algorithms/35_multi_token_overview.svg)
-### Step 2: 候选序列与验证状态
-
-先看一轮验证中有哪些信息，再理解状态如何变化。候选序列说明本轮准备尝试哪些 token；记目标模型对候选 token 给出的概率分布为 p，草稿路径给出的概率分布为 q，二者用于比较候选是否可靠。验证从左到右进行，首次拒绝会把序列分成可接受前缀和待回退后缀。
-
-
-| 机制阶段 | 关键对象 | 作用 |
-|------|----------|------|
-| 提议序列 | 候选 token 与本轮候选上限 | 确定本轮最多尝试的范围 |
-| 接受判断 | 草稿概率与目标概率 | 判断单个候选 token 是否可靠 |
-| 顺序验证 | 候选序列与当前前缀 | 从左到右验证，首次拒绝后停止 |
-| 结果汇总 | 接受前缀、拒绝位置、回退后缀 | 区分可直接推进与需要重新生成的部分 |
-
-### Step 3: 连续接受、首次拒绝与有效推进
-
-多 Token 解码的收益取决于连续接受长度，而不是候选数量本身。若一轮提出四个候选、前面三个通过验证，本轮有效推进量就是三个；若第一个就被拒绝，候选长度再长也不能带来有效推进。接受比例可以帮助比较候选质量，但最终还要结合目标模型验证和回退成本。
-
-因此，原生 MTP 不能只看候选头数量：还要记录实际接受长度、目标验证耗时、额外 MTP 权重与 KV 状态，以及 backend 是否真正启用了 MTP。只有有效推进量能够抵消候选生成和验证成本时，这条路径才有端到端收益。
-
-| 机制因素 | 偏大时的风险 | 偏小时的限制 |
-|------|--------------|--------------|
-| 候选长度 | 尝试范围更大，但拒绝和回退可能增加 | 单轮推进短，潜在收益有限 |
-| 接受阈值 | 判断更严格，连续接受长度可能下降 | 判断更宽松，错误候选或重生成代价可能增加 |
-
-![多 Token 解码的接受长度与收益](../public/02_PyTorch_Algorithms/35_acceptance_budget.svg)
-
-### Step 4: 实现多 Token 候选验证
-
-题目区提供候选概率、目标概率和结果汇总骨架。学习者只需完成候选截断、单点接受判断和连续前缀更新三个机制；测试分别覆盖长度上限、接受阈值、首次拒绝、后缀关闭与全部接受。
-
-| 函数 | 学习者完成的机制 | 必须满足的约束 | 测试证据 |
-|---|---|---|---|
-| `propose` | 按候选预算截取本轮前缀 | 不修改输入，长度不超过上限 | 多种候选长度与空输入 |
-| `_accept_token` | 比较草稿概率、目标概率与接受阈值 | 草稿概率非正时单独处理 | 接受与拒绝阈值边界 |
-| `verify` | 从左到右维护连续接受前缀 | 首次拒绝后立即停止 | 中途拒绝与后续高概率候选 |
-
-
-```python
-from typing import List, Sequence, Tuple
-import torch
-```
-
-
-```python
-class MultiTokenDecoderSim:
-    """教学用的多 token 提议—验证模拟器。
-
-    用于观察候选长度、接受前缀和回退后缀如何共同决定一轮推进结果。"""
-
-    def __init__(self, max_proposal_len: int = 4, min_accept_ratio: float = 0.5):
-        if not isinstance(max_proposal_len, int) or isinstance(max_proposal_len, bool) or max_proposal_len <= 0:
-            raise ValueError("max_proposal_len must be positive")
-        if not (0.0 < min_accept_ratio <= 1.0):
-            raise ValueError("min_accept_ratio must be in (0, 1]")
-        self.max_proposal_len = max_proposal_len
-        self.min_accept_ratio = min_accept_ratio
-        self.history: List[dict] = []
-
-    def propose(self, draft_tokens: Sequence[int]) -> List[int]:
-        """把草稿序列截断为本轮允许验证的候选前缀。
-
-        空序列返回空列表；返回长度不超过 `max_proposal_len`。"""
-        # TODO 1（候选预算）：复制输入并截取本轮允许验证的候选前缀。
-        # proposed = ???
-        raise NotImplementedError('TODO 1：请构造候选前缀')
-        return proposed
-
-    def _accept_token(self, draft_prob: float, target_prob: float) -> bool:
-        """按教学用概率阈值判断一个候选是否通过验证。
-
-        这里的阈值规则用于观察控制流，不等同于严格的分布保持算法。"""
-        # TODO 2（接受阈值）：比较目标概率与草稿概率经过阈值缩放后的下界。
-        if draft_prob <= 0:
-            return target_prob > 0
-        # accepted = ???
-        raise NotImplementedError('TODO 2：请判断候选是否接受')
-        return accepted
-
-    def verify(
-        self,
-        draft_probs: torch.Tensor,
-        target_probs: torch.Tensor,
-        draft_tokens: Sequence[int],
-    ) -> Tuple[List[int], int | None]:
-        """从左到右验证候选，并在首次拒绝处停止。
-
-        `draft_probs` 和 `target_probs` 的第 i 行对应第 i 个候选位置；
-        返回已接受前缀以及首次拒绝的位置。"""
-        proposed = self.propose(draft_tokens)
-        accepted_tokens: List[int] = []
-        rejected_at = None
-        draft_probs = torch.as_tensor(draft_probs)
-        target_probs = torch.as_tensor(target_probs)
-
-        if draft_probs.ndim != 2 or target_probs.ndim != 2:
-            raise ValueError("draft_probs 和 target_probs 必须是二维张量")
-        if draft_probs.shape != target_probs.shape or draft_probs.shape[0] < len(proposed):
-            raise ValueError("概率矩阵必须具有相同形状，并覆盖所有候选位置")
-        vocab_size = draft_probs.shape[1]
-        if any(not isinstance(token_id, int) or not 0 <= token_id < vocab_size for token_id in proposed):
-            raise ValueError("draft token id 必须是词表范围内的整数")
-
-        for i, token_id in enumerate(proposed):
-            draft_prob = float(draft_probs[i, token_id])
-            target_prob = float(target_probs[i, token_id])
-            # TODO 3（连续前缀）：计算当前位置的接受结果；下方骨架负责追加或终止。
-            # accepted = ???
-            raise NotImplementedError('TODO 3：请计算当前位置的接受结果')
-
-            if accepted:
-                accepted_tokens = accepted_tokens + [token_id]
-            else:
-                rejected_at = i
-                break
-
-        return accepted_tokens, rejected_at
-
-    def decode(
-        self,
-        draft_probs: torch.Tensor,
-        target_probs: torch.Tensor,
-        draft_tokens: Sequence[int],
-    ) -> dict:
-        """汇总接受前缀、拒绝位置、回退后缀和本轮推进比例。
-
-        `progress_per_round` 只表示本轮接受比例，不代表真实吞吐提升。"""
-        proposed = self.propose(draft_tokens)
-        accepted_tokens, rejected_at = self.verify(draft_probs, target_probs, draft_tokens)
-        rejected_suffix = proposed[rejected_at:] if rejected_at is not None else []
-
-        result = {
-            "proposed_tokens": proposed,
-            "accepted_tokens": accepted_tokens,
-            "accepted_len": len(accepted_tokens),
-            # 本轮真正推进的 token 占提议长度的比例，和项目 benchmark 的指标对应
-            "progress_per_round": (len(accepted_tokens) / len(proposed)) if proposed else 0.0,
-            "rejected_at": rejected_at,
-            "rejected_suffix": rejected_suffix,
-        }
-        self.history.append(result)
-        return result
-
-```
-
-
-```python
-# 按机制拆分测试，分别定位候选提议、接受判断、首次拒绝和回退状态。
-def _build_multi_token_fixture():
-    """构造包含中途拒绝位置的候选与概率矩阵。"""
-    draft_tokens = [10, 20, 30, 31]
-    draft_probs = torch.zeros(4, 40)
-    target_probs = torch.zeros(4, 40)
-    for index, token in enumerate(draft_tokens):
-        draft_probs[index, token] = 0.5
-        target_probs[index, token] = 0.8 if index < 2 else 0.2
-    return draft_tokens, draft_probs, target_probs
-
-def test_proposal_contract():
-    """验证候选前缀受预算限制且顺序保持不变。"""
-    draft_tokens, _, _ = _build_multi_token_fixture()
-    sim = MultiTokenDecoderSim(max_proposal_len=3, min_accept_ratio=0.6)
-    assert sim.propose(draft_tokens) == [10, 20, 30]
-
-def test_acceptance_rule():
-    """验证单点接受规则的通过与拒绝分支。"""
-    sim = MultiTokenDecoderSim(max_proposal_len=3, min_accept_ratio=0.6)
-    assert sim._accept_token(0.5, 0.31) is True
-    assert sim._accept_token(0.5, 0.2) is False
-
-def test_first_rejection():
-    """验证过程在首次拒绝位置停止。"""
-    draft_tokens, draft_probs, target_probs = _build_multi_token_fixture()
-    sim = MultiTokenDecoderSim(max_proposal_len=3, min_accept_ratio=0.6)
-    accepted, rejected_at = sim.verify(draft_probs, target_probs, draft_tokens)
-    assert accepted == [10, 20]
-    assert rejected_at == 2
-
-def test_rejection_closes_the_suffix():
-    """验证后续高概率候选不能越过首次拒绝。"""
-    draft_tokens, draft_probs, target_probs = _build_multi_token_fixture()
-    target_probs[3, draft_tokens[3]] = 0.9  # 后一个候选即使满足阈值，也不能越过第 3 个位置的拒绝。
-    sim = MultiTokenDecoderSim(max_proposal_len=4, min_accept_ratio=0.6)
-    accepted, rejected_at = sim.verify(draft_probs, target_probs, draft_tokens)
-    assert accepted == [10, 20] and rejected_at == 2
-
-def test_rollback_suffix():
-    """验证拒绝后缀、推进比例与历史记录。"""
-    draft_tokens, draft_probs, target_probs = _build_multi_token_fixture()
-    sim = MultiTokenDecoderSim(max_proposal_len=3, min_accept_ratio=0.6)
-    result = sim.decode(draft_probs, target_probs, draft_tokens)
-    assert result["proposed_tokens"] == [10, 20, 30]
-    assert result["accepted_tokens"] == [10, 20]
-    assert result["accepted_len"] == 2
-    assert result["progress_per_round"] == 2 / 3
-    assert result["rejected_at"] == 2
-    assert result["rejected_suffix"] == [30]
-    assert len(sim.history) == 1
-
-def test_all_accept_and_variable_length():
-    """验证不同候选预算下的全部接受路径。"""
-    draft_tokens, draft_probs, _ = _build_multi_token_fixture()
-    all_target = torch.zeros(4, 40)
-    for index, token in enumerate(draft_tokens):
-        all_target[index, token] = 0.8
-    for proposal_len in (1, 2, 3, 4):
-        sim = MultiTokenDecoderSim(max_proposal_len=proposal_len, min_accept_ratio=0.6)
-        result = sim.decode(draft_probs, all_target, draft_tokens)
-        assert result["accepted_len"] == proposal_len
-        assert result["progress_per_round"] == 1.0
-        assert result["rejected_at"] is None
-        assert result["rejected_suffix"] == []
-
-def test_multi_token_decoder():
-    """汇总运行候选、接受、拒绝和回退机制测试。"""
-    try:
-        test_proposal_contract()
-        test_acceptance_rule()
-        test_first_rejection()
-        test_rejection_closes_the_suffix()
-        test_rollback_suffix()
-        test_all_accept_and_variable_length()
-        print("✅ MultiTokenDecoderSim 机制测试通过：提议、接受、拒绝和回退均符合预期。")
-    except NotImplementedError:
-        print("请先完成 TODO 部分的代码！")
-        raise
-    except Exception as error:
-        print(f"❌ MultiTokenDecoderSim 测试失败: {type(error).__name__}: {error}")
-        raise
-
-
-test_multi_token_decoder()
-
-```
+---
 
 
 ## 参考代码与解析
@@ -282,146 +229,234 @@ test_multi_token_decoder()
 ### 代码
 
 
+
 ```python
-class MultiTokenDecoderSim:
-    """教学用的多 token 提议—验证模拟器。
+def _validate_depth_logits(depth_logits: torch.Tensor) -> torch.Tensor:
+    """校验 MTP 预测深度与词表维度。"""
+    scores = torch.as_tensor(depth_logits)
+    if scores.ndim != 2 or scores.shape[0] == 0 or scores.shape[1] == 0:
+        raise ValueError("depth_logits 必须是非空二维张量 [depth, vocab]")
+    if not torch.isfinite(scores).all():
+        raise ValueError("词表分数不能包含 NaN 或 Inf")
+    return scores
 
-    用于观察候选长度、接受前缀和回退后缀如何共同决定一轮推进结果。"""
 
-    def __init__(self, max_proposal_len: int = 4, min_accept_ratio: float = 0.5):
-        if not isinstance(max_proposal_len, int) or isinstance(max_proposal_len, bool) or max_proposal_len <= 0:
-            raise ValueError("max_proposal_len must be positive")
-        if not (0.0 < min_accept_ratio <= 1.0):
-            raise ValueError("min_accept_ratio must be in (0, 1]")
-        self.max_proposal_len = max_proposal_len
-        self.min_accept_ratio = min_accept_ratio
-        self.history: List[dict] = []
+# ==========================================
+# TODO 1：从各预测深度形成有序候选块。
+# ==========================================
+def select_mtp_candidates(depth_logits: torch.Tensor, max_candidates: int) -> List[int]:
+    """按预测深度形成受预算约束的有序候选块。"""
+    scores = _validate_depth_logits(depth_logits)
+    if not isinstance(max_candidates, int) or isinstance(max_candidates, bool) or max_candidates < 1:
+        raise ValueError("max_candidates 必须是正整数")
+    candidates = scores.argmax(dim=-1)[:max_candidates].tolist()
+    return candidates
 
-    def propose(self, draft_tokens: Sequence[int]) -> List[int]:
-        """把草稿序列截断为本轮允许验证的候选前缀。
 
-        空序列返回空列表；返回长度不超过 `max_proposal_len`。"""
-        # ==========================================
-        # TODO 1: 从草稿 token 中生成本轮候选序列
-        # 提示：先把 draft_tokens 转成 list，再截取前 max_proposal_len 个 token。
-        # 这个结果决定本轮最多验证多少个位置，不要修改输入序列。
-        # ==========================================
-        proposed = list(draft_tokens)[: self.max_proposal_len]
-        return proposed
+# ==========================================
+# TODO 2：在首次不匹配位置停止连续接受。
+# ==========================================
+def continuous_match_length(
+    candidates: Sequence[int],
+    target_tokens: Sequence[int],
+) -> int:
+    """返回候选与目标结果从首位置开始连续匹配的长度。"""
+    if len(target_tokens) < len(candidates):
+        raise ValueError("目标结果必须覆盖所有候选位置")
+    accepted_length = 0
+    for candidate, target in zip(candidates, target_tokens):
+        matches = int(candidate) == int(target)
+        if not matches:
+            break
+        accepted_length += 1
+    return accepted_length
 
-    def _accept_token(self, draft_prob: float, target_prob: float) -> bool:
-        """按教学用概率阈值判断一个候选是否通过验证。
 
-        这里的阈值规则用于观察控制流，不等同于严格的分布保持算法。"""
-        # ==========================================
-        # TODO 2: 判断单个候选 token 是否被目标模型接受
-        # 提示：正常情况下，target_prob 至少要达到
-        # draft_prob * min_accept_ratio；draft_prob <= 0 时单独处理，并保持布尔返回值。
-        # ==========================================
-        if draft_prob <= 0:
-            return target_prob > 0
-        accepted = target_prob >= draft_prob * self.min_accept_ratio
-        return accepted
-
-    def verify(
-        self,
-        draft_probs: torch.Tensor,
-        target_probs: torch.Tensor,
-        draft_tokens: Sequence[int],
-    ) -> Tuple[List[int], int | None]:
-        """从左到右验证候选，并在首次拒绝处停止。
-
-        `draft_probs` 和 `target_probs` 的第 i 行对应第 i 个候选位置；
-        返回已接受前缀以及首次拒绝的位置。"""
-        proposed = self.propose(draft_tokens)
-        accepted_tokens: List[int] = []
-        rejected_at = None
-        draft_probs = torch.as_tensor(draft_probs)
-        target_probs = torch.as_tensor(target_probs)
-
-        if draft_probs.ndim != 2 or target_probs.ndim != 2:
-            raise ValueError("draft_probs 和 target_probs 必须是二维张量")
-        if draft_probs.shape != target_probs.shape or draft_probs.shape[0] < len(proposed):
-            raise ValueError("概率矩阵必须具有相同形状，并覆盖所有候选位置")
-        vocab_size = draft_probs.shape[1]
-        if any(not isinstance(token_id, int) or not 0 <= token_id < vocab_size for token_id in proposed):
-            raise ValueError("draft token id 必须是词表范围内的整数")
-
-        for i, token_id in enumerate(proposed):
-            draft_prob = float(draft_probs[i, token_id])
-            target_prob = float(target_probs[i, token_id])
-            # ==========================================
-            # TODO 3: 维护连续接受前缀
-            # 提示：先得到 accepted。若为 True，将 token 加入 accepted_tokens；
-            #       若为 False，记录当前 i 为 rejected_at 并停止，后续候选不能继续加入。
-            # ==========================================
-            accepted = self._accept_token(draft_prob, target_prob)
-
-            if accepted:
-                accepted_tokens = accepted_tokens + [token_id]
-            else:
-                rejected_at = i
-                break
-
-        return accepted_tokens, rejected_at
-
-    def decode(
-        self,
-        draft_probs: torch.Tensor,
-        target_probs: torch.Tensor,
-        draft_tokens: Sequence[int],
-    ) -> dict:
-        """汇总接受前缀、拒绝位置、回退后缀和本轮推进比例。
-
-        `progress_per_round` 只表示本轮接受比例，不代表真实吞吐提升。"""
-        proposed = self.propose(draft_tokens)
-        accepted_tokens, rejected_at = self.verify(draft_probs, target_probs, draft_tokens)
-        rejected_suffix = proposed[rejected_at:] if rejected_at is not None else []
-
-        result = {
-            "proposed_tokens": proposed,
-            "accepted_tokens": accepted_tokens,
-            "accepted_len": len(accepted_tokens),
-            # 本轮真正推进的 token 占提议长度的比例，和项目 benchmark 的指标对应
-            "progress_per_round": (len(accepted_tokens) / len(proposed)) if proposed else 0.0,
-            "rejected_at": rejected_at,
-            "rejected_suffix": rejected_suffix,
-        }
-        self.history.append(result)
-        return result
+# ==========================================
+# TODO 3：提交接受前缀，并追加修正或额外目标 Token。
+# ==========================================
+def build_mtp_round(candidates: Sequence[int], target_tokens: Sequence[int]) -> dict:
+    """根据连续匹配边界形成本轮输出和下一轮状态。"""
+    if len(target_tokens) != len(candidates) + 1:
+        raise ValueError("目标结果必须包含候选位置和一个额外位置")
+    accepted_length = continuous_match_length(candidates, target_tokens)
+    emitted_tokens = list(candidates[:accepted_length]) + [int(target_tokens[accepted_length])]
+    all_candidates_accepted = accepted_length == len(candidates)
+    return {
+        "candidate_count": len(candidates),
+        "accepted_length": accepted_length,
+        "emitted_tokens": emitted_tokens,
+        "all_candidates_accepted": all_candidates_accepted,
+        "first_mismatch": None if all_candidates_accepted else accepted_length,
+    }
 
 ```
 
+
 ### 解析
 
-**TODO 1：构造候选前缀**
-- 将草稿 token 复制为列表后按 `max_proposal_len` 截取。候选长度只规定本轮最多验证多少个位置，不改变原始草稿序列。
+#### TODO 1：形成候选块
 
-**TODO 2：判断当前位置是否接受**
-- 当 `draft_prob > 0` 时，比较 `target_prob` 与 `draft_prob * min_accept_ratio`；草稿概率为零时单独处理，避免把无意义的比例带入判断。
+**思路：** 每个深度一行 logits，各取 argmax，按深度顺序排，再截到预算。
 
-**TODO 3：维护连续接受前缀**
-- 验证顺序决定状态：当前 token 被接受才可继续；首次拒绝的位置写入 `rejected_at` 后立即停止。这样 `accepted_tokens` 始终是候选序列的连续前缀，`rejected_suffix` 则由骨架据此生成。
+**关键一行：**
+```python
+candidates = scores.argmax(dim=-1)[:max_candidates].tolist()
+```
 
-| 观察量 | 说明 | 在后续基准中的作用 |
-|---|---|---|
-| `max_proposal_len` | 每轮最多尝试的候选数 | 影响可获得的推进空间 |
-| `accepted_len` / `progress_per_round` | 本轮实际被连续接受的前缀 | 反映候选质量与回退压力 |
-| `rejected_at` / `rejected_suffix` | 首次拒绝及其后的候选 | 说明下一轮需要重新处理的部分 |
+**为什么这样写：** `argmax(dim=-1)` 一次对所有深度求最大值位置，得到形状 `[depth]` 的张量，天然就是按深度排列的；`[:max_candidates]` 在深度维上截断，预算大于深度数时自然取全部。转成 Python `list[int]` 是为了后面和 `target_tokens` 逐个比较时不混入 0 维张量。
+
+**常见错法：** 先按分数高低给候选排序再截断。候选的顺序就是位置的顺序，深度 1 永远对应最近的那个位置，按分数重排会把"第二个 token"放到"第一个"的位置上去验证，必然不匹配。
+
+#### TODO 2：连续匹配长度
+
+**思路：** 从左到右比，相同就计数，不同就停。
+
+**关键一行：**
+```python
+matches = int(candidate) == int(target)
+```
+
+**为什么这样写：** 两边都转 `int`，是因为 `candidates` 可能来自 `tolist()` 的 Python 整数，`target_tokens` 可能来自张量切片；`torch.tensor(5) == 5` 返回的是 0 维布尔张量而不是 `bool`，`if not matches` 虽然能跑，但显式转成整数可以让这一教学接口统一使用 Python 标量。`break` 保证一旦不匹配就不再往后看——这是陷阱一的实现。
+
+**常见错法：** 用 `sum(c == t for c, t in zip(...))` 数相同的个数。`[4, 7, 6]` 对 `[4, 5, 6]` 会得到 2，而正确答案是 1：第三个位置的"碰巧相同"不能算。
+
+#### TODO 3：本轮输出
+
+**思路：** 接受的前缀，加上 `target_tokens` 在第 `accepted_length` 个位置的那个 token。
+
+**关键一行：**
+```python
+emitted_tokens = list(candidates[:accepted_length]) + [int(target_tokens[accepted_length])]
+all_candidates_accepted = accepted_length == len(candidates)
+```
+
+**为什么这样写：** `target_tokens` 的长度是 $K+1$，下标 `accepted_length` 恰好统一了两种情况：中途不匹配时它指向主模型在不匹配位置给的修正 token；全部接受时 `accepted_length == K`，它指向多出来的 bonus 位置。一行代码两种语义，不需要 `if`。
+
+**常见错法：** 全部接受时忘了加 bonus，只返回 `candidates`；或者不匹配时把候选的后缀也带上。前者少赚一个 token，后者直接输出了未经验证的内容——测试里 `emitted_tokens == [4, 5, 9]` 对应的候选是 `[4, 5, 6]`，6 必须不在输出里。
+
+### Step 5：GPU 实验——真实 backend 上的原生 MTP
+
+CPU 题目区验证的是候选形成和贪心验证的逻辑，它不知道一个真实 checkpoint 里到底有几个 MTP 层、vLLM 会不会真的走 MTP 路径、也测不出时间。GPU 实验要回答的是：同一个 checkpoint，"只用主模型"和"主模型 + MTP-1"两条路径能不能成功配对，输出是否一致，接受长度、Median/P95、吞吐和峰值显存各是多少。注意实验的前半段——确认 checkpoint 含 MTP 层、让主模型路径先完整跑通——和 MTP 本身一样重要：环境或 kernel 的问题会在这一步暴露，而不该被记成 MTP 的性能结论。
+
+#### 5.1 环境与 workload
+
+本实验使用隔离的 `INF-VLLM-MTP` 环境。首次运行先完成[推理优化实验 Quickstart](../topic_discussion/inference_optimization/quickstart.md#inf-vllm-mtp-quickstart)；已有环境先通过同名 Profile 预检。只有主模型路径完成模型加载、kernel 初始化、预热和写死输入的生成之后，才启用 MTP-1。
+
+| 配置层 | 本节的设定 | 修改规则 |
+| --- | --- | --- |
+| 运行环境 | `INF-VLLM-MTP`；隔离的 vLLM、PyTorch、CUDA wheel 与 Triton 组合 | 更换驱动、wheel 或 Triton 后使用新运行标签，并先重跑主模型路径 |
+| 12 GB 配置 | `Qwen/Qwen3.5-0.8B`；MTP-1；BF16；batch 1；`max_model_len=2048`；显存利用率 0.75 | checkpoint 必须包含原生 MTP 层；候选深度不超过可用层数 |
+| 24 GB 配置 | 先复用 0.8B 配对，再扩大上下文、并发或重复次数 | 9B BF16 不作为默认配置；更换模型后单独登记 workload 版本 |
+| 对照 | 同一 checkpoint 的主模型 → 主模型 + MTP-1 | 两条路径共用输入、dtype、生成长度、随机种子和执行模式 |
+| 测量 | 输出一致性、接受长度、Median/P95、吞吐、峰值显存和失败阶段 | 初始化和下载不计入正式延迟；两条路径分别预热 |
+| 结果文件 | `benchmarks/results/inf_mtp_<run_label>.json` | 正式运行使用唯一标签；失败结果不覆盖 |
 
 
-### 真实 GPU 验证出口
+```python
+RUN_MODE = 'real_backend'  # 默认 real_backend；只做配置检查时改为 dry_run。
+RUN_LABEL = 'rtx5070ti_qwen35_08b_mtp1_v4'  # 默认不覆盖实测结果；真实复测改为唯一标签。
+PROFILE_ID = 'INF-VLLM-MTP'  # 原生 MTP 使用独立 vLLM 环境。
+SEMANTIC_ID = 'INF-MTP'  # 稳定机制身份。
+WORKLOAD_ID = 'inf-native-mtp-qwen35-08b'  # 稳定工作负载身份。
+WORKLOAD_VERSION = 'v2'  # v2 固定原生 MTP-1 与隔离 worker 配对协议。
+MODEL_ID = 'Qwen/Qwen3.5-0.8B'  # 默认原生 MTP 小模型。
+MODEL_REVISION = 'main'  # 运行时自动解析并记录不可变 commit。
+DTYPE = 'bfloat16'  # baseline 与 candidate 共用 BF16。
+MAX_NEW_TOKENS = 64  # 每条提示固定生成 64 Token。
+MAX_MODEL_LEN = 2048  # 单卡机制实验只保留短上下文容量。
+GPU_MEMORY_UTILIZATION = 0.75  # 为 Notebook 与 backend 保留显存余量。
+ENFORCE_EAGER = False  # 两条路径共用 vLLM 默认编译/CUDA Graph 路径。
+WARMUP_STEPS = 2  # 每条路径独立预热 2 次。
+REPEAT_STEPS = 5  # 每条路径正式重复 5 次。
+SPECULATIVE_TOKENS = 1  # checkpoint 只有一个原生 MTP 层。
+SEED = 42  # 固定贪心生成与 backend 随机状态。
+PROMPTS = [
+    'Explain why speculative decoding can reduce latency in two concise paragraphs.',
+    'Write a Python function that checks whether a string is a palindrome, then explain its complexity.',
+    'A shop applies a 20 percent discount and then a 10 percent tax. Explain the final price for an item costing 100 dollars.',
+]
+OUTPUT_RELATIVE_PATH = f'02_PyTorch_Algorithms/benchmarks/results/inf_mtp_{RUN_LABEL}.json'
 
-本节的 CPU 实现用于验证候选组织、连续接受、首次拒绝与回退状态。同一份 logits 上的批量前缀运算不是 MTP GPU 实验，因为它没有真实草稿模块、目标验证、KV Cache 和服务调度。
+```
 
-真实验需要固定目标模型与 MTP 草稿模块，比较自回归 baseline 与 MTP candidate 的接受率、有效推进 Token、TPOT、吞吐和输出质量。该证据由 [68 投机解码基准](./68_Speculative_Decoding_Benchmark.md) 在真实 backend 中承接。
+
+#### 5.2 执行真实 backend 配对并保存 JSON
+
+本单元先读模型配置确认原生 MTP 层的数量，再用两个独立子进程顺序执行主模型路径与 MTP-1 路径。初始化和模型下载不计入正式延迟；两条路径分别预热后才采集结果。
+
+
+```python
+import importlib
+from tools.project_runtime import resolve_project_root
+import tools.mtp_mechanism_runtime as mtp_runtime
+
+mtp_runtime = importlib.reload(mtp_runtime)
+RESULT_PATH = resolve_project_root() / OUTPUT_RELATIVE_PATH
+GPU_REPORT = mtp_runtime.run_native_mtp_benchmark(
+    semantic_id=SEMANTIC_ID, profile_id=PROFILE_ID, run_mode=RUN_MODE, run_label=RUN_LABEL,
+    workload_id=WORKLOAD_ID, workload_version=WORKLOAD_VERSION,
+    model_id=MODEL_ID, model_revision=MODEL_REVISION, dtype=DTYPE, prompts=PROMPTS,
+    max_new_tokens=MAX_NEW_TOKENS, max_model_len=MAX_MODEL_LEN,
+    gpu_memory_utilization=GPU_MEMORY_UTILIZATION, enforce_eager=ENFORCE_EAGER,
+    warmup_steps=WARMUP_STEPS, repeat_steps=REPEAT_STEPS,
+    speculative_tokens=SPECULATIVE_TOKENS, seed=SEED, output_path=RESULT_PATH,
+)
+GPU_REPORT
+
+```
+
+
+#### 5.3 读取结果
+
+读取模型信息、两条路径和配对比较。`failure` 非空时先处理环境、模型或 backend 的问题，不解释性能字段。
+
+
+```python
+import json
+from pathlib import Path
+
+report = json.loads(Path(RESULT_PATH).read_text(encoding='utf-8'))
+{
+    'semantic_id': report.get('semantic_id'),
+    'workload': report.get('workload'),
+    'model_contract': report.get('model_contract'),
+    'comparison': report.get('comparison'),
+    'failure': report.get('failure'),
+    'evidence_level': report.get('evidence_level'),
+    'decision': report.get('decision'),
+}
+
+```
+
+
+#### 5.4 解释结果并作出决策
+
+RTX 5070 Ti 上已完成一次真实 backend 尝试。Qwen3.5-0.8B 的模型配置和一个原生 MTP 层都被正确识别，但主模型路径在 vLLM 初始化 Triton RoPE kernel 时失败（`device kernel image is invalid`），因此本次运行没有产生 baseline / candidate 配对结果。
+
+失败发生在启用 MTP **之前**，说明是当前驱动、CUDA 12.9 wheel、vLLM 与 Triton 的组合跑不起来——这既不是 MTP 的性能结论，也不是显存不足。下一次运行要先让主模型路径完整生成写死的输出，再启用 MTP-1。
+
+| 观察项 | 读取字段 | 当前结果 | 解释与动作 |
+| --- | --- | --- | --- |
+| 模型信息 | `model_contract`、resolved commit | Qwen3.5-0.8B commit `2fc0636`；识别 1 个 MTP 层 | checkpoint 支持 MTP-1 |
+| backend 启动 | `failure`、`evidence_level` | Triton RoPE kernel 报 `device kernel image is invalid` | 主模型路径没跑起来，保留失败时的环境快照 |
+| 正确性与推进 | `comparison`、接受统计 | 未产生 | 修复执行栈后重新生成配对结果 |
+| 性能与资源 | Median/P95、吞吐、峰值显存 | 未产生 | 不用初始化失败的耗时推断性能 |
+| 决策 | `evidence_level`、`decision` | `failed_real_backend_attempt`；`reject_until_fixed` | 在兼容环境从主模型路径开始再跑 |
+
+<a id="cheatsheet"></a>
+## 速查卡
+
+| | |
+|:--|:--|
+| **一句话机制** | 把 draft 做进模型自身：checkpoint 内的 MTP 模块复用主模型隐藏状态，每个深度猜一个更远的 token，按深度排成候选块；主模型一次前向验证全部，贪心下"候选 == argmax"即接受，首次不匹配处用主模型的 token 修正并停止；全中时第 $K+1$ 个位置白送一个 bonus。 |
+| **关键公式与数量级** | 候选块 = 各深度 argmax 的前 $\min(\text{budget}, \text{depth})$ 个；接受长度 $L \in [0, K]$，每轮推进 $L+1$ 个 token。DeepSeek-V3 论文报告第二个 token 接受率 85%–90%、解码 TPS 约 1.8×。本节实验 Qwen3.5-0.8B 含 1 个 MTP 层；一次真实 backend 尝试因 Triton RoPE kernel 失败未产生配对结果。 |
+| **常见坑** | 1. 候选按分数重排——顺序就是位置，不能动。2. 数"相同的个数"而不是"连续前缀长度"：`[4,7,6]` vs `[4,5,6]` 是 1 不是 2。3. 贪心验证用在采样路径上——不再无损，要换 23 节的概率规则。4. 把层数当成所有 backend 的候选上限；本题只截取已有 logits 行。5. 接受长度高 ≠ 提速：MTP 模块的额外计算和验证前向要一起算。 |
+| **延伸阅读** | 专题正文 [03 解码策略](../topic_discussion/inference_optimization/03_decoding_strategies.md) · 判断手册 [按现象选择机制](../topic_discussion/inference_optimization/casebook.md#按现象选择机制) · 另一条路 [INF-EAGLE](./INF-EAGLE_Feature_Drafter_and_Candidate_Tree.md)：给没有 MTP 层的模型外挂一个复用隐藏状态的 drafter · 预算怎么定 [INF-PROPOSAL](./INF-PROPOSAL_Dynamic_Proposal_and_Verification_Budget.md) · 真实后端 [68](./68_Speculative_Decoding_Benchmark.md) |
+
 ## 相关阅读
 
-完成原生 MTP 候选、顺序验证和回退处理后，可以继续比较外置特征草稿、块并行草稿与真实 backend benchmark。
-
-- [DeepSeek-V3：Multi-Token Prediction](https://arxiv.org/abs/2412.19437)
-- [vLLM Speculators：MTP](https://docs.vllm.ai/projects/speculators/en/latest/user_guide/algorithms/decision_guide/)
-- [INF-EAGLE：特征草稿器与候选树](./INF-EAGLE_Feature_Drafter_and_Candidate_Tree.md)
-- [INF-PARALLEL-DRAFTING：DFlash 与 DSpark](./INF-PARALLEL-DRAFTING_DFlash_and_DSpark.md)
-- [36. Decode Scheduling | Decode 调度](./36_Decode_Scheduling.md)
-- [68. Speculative Decoding Benchmark | 投机解码基准](./68_Speculative_Decoding_Benchmark.md)
+- [DeepSeek-V3 Technical Report](https://arxiv.org/abs/2412.19437) —— Section 2.2 的 MTP 模块结构（隐藏状态 + 下一 token embedding → 一个 block → 共享输出头），以及推理侧接受率的报告
+- [vLLM Speculators：MTP](https://docs.vllm.ai/projects/speculators/en/latest/user_guide/algorithms/decision_guide/) —— 哪些模型带 MTP 层、`num_speculative_tokens` 怎么配
+- [Part 02 · INF-EAGLE 特征草稿器与候选树](./INF-EAGLE_Feature_Drafter_and_Candidate_Tree.md) —— 同样复用隐藏状态，但 drafter 是训练后外挂的
+- [Part 02 · INF-PARALLEL-DRAFTING 并行草稿与置信度调度](./INF-PARALLEL-DRAFTING_DFlash_and_DSpark.md) —— 不串行递推、一次并行出一块候选

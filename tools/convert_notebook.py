@@ -4,6 +4,8 @@ import shutil
 import json
 import re
 import argparse
+import html
+import xml.etree.ElementTree as ET
 
 SOURCE_DIRS = [
     "00_Prerequisites",
@@ -82,9 +84,28 @@ def process_first_cell(source_text, ipynb_path):
 
 def normalize_markdown_links(source_text):
     """将 source 侧 Markdown 中的常见链接改写为 docs 镜像可用的路径。"""
-    source_text = re.sub(r'(\]\([^)]+)\.ipynb\)', r'\1.md)', source_text)
+    source_text = re.sub(r'(\]\([^)\s]+)\.ipynb(#[^)\s]*)?\)', r'\1.md\2)', source_text)
     source_text = source_text.replace('../docs/', '../')
     return source_text
+
+def reserve_local_svg_space(source_text, source_path):
+    """Keep anchor jumps stable before local diagrams finish loading."""
+    def replace_image(match):
+        alt, target = match.groups()
+        if re.match(r"(?:[a-zA-Z][\w+.-]*:|/)", target):
+            return match.group(0)
+        image_path = os.path.join(os.path.dirname(source_path), target)
+        try:
+            svg = ET.parse(image_path).getroot()
+        except (OSError, ET.ParseError):
+            return match.group(0)
+        width, height = svg.get("width", ""), svg.get("height", "")
+        if not all(re.fullmatch(r"\d+(?:\.\d+)?", value) for value in (width, height)):
+            return match.group(0)
+        return (f'<img src="{html.escape(target, quote=True)}" '
+                f'alt="{html.escape(alt, quote=True)}" width="{width}" height="{height}">')
+
+    return re.sub(r"!\[([^\]\n]*)\]\(([^)\s]+\.svg)\)", replace_image, source_text)
 
 def process_markdown_file(md_path, out_path):
     """处理纯 Markdown 文件，主要是合并双语标题"""
@@ -243,6 +264,7 @@ def main():
             for i, cell in enumerate(nb['cells']):
                 if cell['cell_type'] == 'markdown':
                     source = "".join(cell['source'])
+                    source = reserve_local_svg_space(source, source_path)
                     source = normalize_markdown_links(source)
                     if i == 0:
                         source = process_first_cell(source, source_path)
@@ -253,7 +275,9 @@ def main():
                     if source.strip():
                         md_lines.append("\n```python\n" + source + "\n```\n")
 
-            write_text(out_path, "\n".join(md_lines))
+            # Each cell is a separate Markdown block. A blank line also closes
+            # HTML blocks such as </details> before the next cell's heading.
+            write_text(out_path, "\n\n".join(md_lines))
             converted_count += 1
         else:
             if args.dry_run:

@@ -59,6 +59,48 @@ export default defineConfig({
       { text: '专题讨论', link: '/topic_discussion/intro' },
       { text: '组队学习', link: '/team_study/intro' },
     ],
+    search: {
+      provider: 'local',
+      options: {
+        detailedView: true,
+        translations: {
+          button: { buttonText: '搜索', buttonAriaLabel: '搜索' },
+          modal: {
+            displayDetails: '显示详细列表',
+            resetButtonTitle: '清除',
+            backButtonTitle: '关闭',
+            noResultsText: '没有找到结果',
+            footer: { selectText: '选择', navigateText: '切换', closeText: '关闭' }
+          }
+        },
+        miniSearch: {
+          options: {
+            // Serialized and re-created in the browser, so it must stay self-contained.
+            // Latin tokens keep '-' (top-p, decoder-only); CJK runs become bigrams
+            // because minisearch would otherwise index a whole Chinese sentence as one token.
+            tokenize: (text: string) => {
+              const out: string[] = []
+              for (const seg of text.toLowerCase().split(/[^\p{L}\p{N}-]+/u)) {
+                if (!seg) continue
+                for (const run of seg.split(/([\u3400-\u9fff]+)/u)) {
+                  if (!run) continue
+                  if (!/^[\u3400-\u9fff]+$/u.test(run)) { out.push(run); continue }
+                  if (run.length === 1) out.push(run)
+                  for (let i = 0; i + 1 < run.length; i++) out.push(run.slice(i, i + 2))
+                }
+              }
+              return out
+            }
+          },
+          searchOptions: {
+            fuzzy: 0.1,
+            prefix: true,
+            combineWith: 'AND',
+            boost: { title: 4, text: 2, titles: 1 }
+          }
+        }
+      }
+    },
     sidebar: [
       {
         text: '介绍',
@@ -95,15 +137,19 @@ export default defineConfig({
             collapsed: true,
             items: [
               { text: '专题导读', link: '/topic_discussion/inference_optimization/intro' },
-              { text: '01. 请求路径与指标', link: '/topic_discussion/inference_optimization/01_request_path_and_metrics' },
+              { text: '问题链：从症状到决策', link: '/topic_discussion/inference_optimization/walkthrough' },
+              { text: '01. 请求链路与指标', link: '/topic_discussion/inference_optimization/01_request_path_and_metrics' },
               { text: '02. Prefill 与 Attention Kernel', link: '/topic_discussion/inference_optimization/02_prefill_and_attention_kernel' },
               { text: '03. 解码策略', link: '/topic_discussion/inference_optimization/03_decoding_strategies' },
-              { text: '04. KV Cache 与调度', link: '/topic_discussion/inference_optimization/04_kv_cache_and_scheduling' },
+              { text: '04. KV Cache 表示、管理与复用', link: '/topic_discussion/inference_optimization/04_kv_cache_lifecycle_and_reuse' },
               { text: '05. 量化推理与部署', link: '/topic_discussion/inference_optimization/05_quantized_inference_and_deployment' },
-              { text: '06. Benchmark 与决策', link: '/topic_discussion/inference_optimization/06_benchmark_and_decision' },
-              { text: '07. 可视化资产', link: '/topic_discussion/inference_optimization/07_visual_assets' },
-              { text: '正文手册', link: '/topic_discussion/inference_optimization/casebook' },
-              { text: '深入阅读', link: '/topic_discussion/inference_optimization/walkthrough' }
+              { text: '06. 端到端基准与决策', link: '/topic_discussion/inference_optimization/06_benchmark_and_decision' },
+              { text: '07. Serving 调度与 PD 分离', link: '/topic_discussion/inference_optimization/07_serving_scheduling_and_pd' },
+              { text: '08. 分布式推理与并行', link: '/topic_discussion/inference_optimization/08_distributed_inference_and_parallelism' },
+              { text: '判断手册（速查）', link: '/topic_discussion/inference_optimization/casebook' },
+              { text: '术语表', link: '/topic_discussion/inference_optimization/glossary' },
+              { text: '实验 Quickstart', link: '/topic_discussion/inference_optimization/quickstart' },
+              { text: '实验资产表', link: '/topic_discussion/inference_optimization/experiment_assets' }
             ]
           },
           {
@@ -361,13 +407,18 @@ export default defineConfig({
             ]
           },
           {
-            text: '2.6 推理执行基础',
+            text: '2.6 推理执行与生成加速',
             collapsed: true,
             items: [
               { text: '组内导读', link: '/02_PyTorch_Algorithms/2_6' },
               { text: '20. FlashAttention 模拟', link: '/02_PyTorch_Algorithms/20_FlashAttention_Sim' },
+              { text: '执行融合与后端分派', link: '/02_PyTorch_Algorithms/INF-EXECUTION-DISPATCH_Inference_Fusion_and_Backend_Dispatch' },
               { text: '21. 解码策略', link: '/02_PyTorch_Algorithms/21_Decoding_Strategies' },
-              { text: '22. vLLM 分页注意力', link: '/02_PyTorch_Algorithms/22_vLLM_PagedAttention' }
+              { text: '23. 投机解码', link: '/02_PyTorch_Algorithms/23_Speculative_Decoding' },
+              { text: '35. 原生多 Token 预测', link: '/02_PyTorch_Algorithms/35_Multi_Token_Decoding' },
+              { text: 'EAGLE 特征草稿与候选树', link: '/02_PyTorch_Algorithms/INF-EAGLE_Feature_Drafter_and_Candidate_Tree' },
+              { text: 'DFlash / DSpark 并行草稿', link: '/02_PyTorch_Algorithms/INF-PARALLEL-DRAFTING_DFlash_and_DSpark' },
+              { text: '动态提议与验证预算', link: '/02_PyTorch_Algorithms/INF-PROPOSAL_Dynamic_Proposal_and_Verification_Budget' }
             ]
           },
           {
@@ -375,10 +426,9 @@ export default defineConfig({
             collapsed: true,
             items: [
               { text: '组内导读', link: '/02_PyTorch_Algorithms/2_7' },
-              { text: '23. 投机解码', link: '/02_PyTorch_Algorithms/23_Speculative_Decoding' },
+              { text: '22. vLLM 分页注意力', link: '/02_PyTorch_Algorithms/22_vLLM_PagedAttention' },
               { text: '24. Prefix Cache 匹配与复用', link: '/02_PyTorch_Algorithms/24_Prefix_Cache_Matching_and_Reuse' },
               { text: '34. SGLang 基数注意力', link: '/02_PyTorch_Algorithms/34_SGLang_RadixAttention' },
-              { text: '35. Multi-Token Decoding', link: '/02_PyTorch_Algorithms/35_Multi_Token_Decoding' },
               { text: '36. Decode Scheduling', link: '/02_PyTorch_Algorithms/36_Decode_Scheduling' },
               { text: '37. KV Cache Lifecycle and Capacity Control', link: '/02_PyTorch_Algorithms/37_KV_Cache_Lifecycle_and_Capacity_Control' },
               { text: 'Continuous Batching', link: '/02_PyTorch_Algorithms/INF-CONTINUOUS-BATCHING_Continuous_Batching' },

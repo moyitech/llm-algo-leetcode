@@ -1,104 +1,78 @@
-# 02. Prefill and Attention Kernel | Prefill 与 Attention Kernel
+# 02. Prefill and Attention Kernel | Prefill 与注意力计算内核
 
 ## 学习问题
 
-从一个长 Prompt 请求开始，观察 Prefill 为什么会推高 `TTFT`，再区分 Attention 访存、Chunked Prefill 和 Prefix Cache 分别解决哪类问题。
+同一个模型，输入从 2k token（词元）增加到 32k，首个字迟迟不出来。应该换 FlashAttention、拆开长输入，还是缓存公共前缀？三种优化都可能降低等待，却作用在不同位置。先沿着一次 prefill（预填充）看清数据怎样计算和保存，再决定改哪里。
 
 ## 核心机制
 
-Prefill 处理已有 Prompt，Prompt 变长通常会推高 `TTFT`。先把“标准 Attention + 一次完整 Prefill”作为参考行为：不使用 FlashAttention、不分块，也不复用前缀，在固定 Prompt、模型和硬件下记录 `TTFT`、Attention 时间与峰值显存。再区分三类瓶颈：Attention 访存、单次 Prefill 规模，以及重复前缀计算。下图呈现基线与候选机制的关系，表格用于快速分流；FlashAttention 处理访存，Chunked Prefill 处理单次工作量，Prefix Cache 则作为重复前缀的 Prefill 优化入口。
+### 一次 prefill 既计算输出，也建立后续状态
 
-### Attention 数据流：从 Prompt 到 KV 状态
+假设输入有 2048 个 token。每层先生成 Q、K、V，用 Q 与 K 的相关性计算 attention（注意力），再汇总 V 并传给下一层。与此同时，K/V 写入 KV Cache（键值缓存）。之后每轮 decode（解码）只追加少量 token，读取已有 K/V，不必重新计算所有历史位置的表示。
 
-一段 Prompt 进入模型后，Attention 相关路径可以按下面的顺序理解：输入先经过 Q/K/V 投影，再生成 Query 与 Key 的相关性分数；Softmax 把分数变成权重，随后与 Value 聚合并写入后续层需要的状态。Prefill 会对整段 Prompt 批量处理，并把可复用的 K/V 状态写入 KV Cache；Decode 则只为新 token 追加状态，同时读取已有 Cache。
+分数矩阵是临时中间量，K/V 是后续生成仍需要的状态，两者不能混为一谈。例如 batch=1、32 个 query head、长度 32768，仅 BF16 的完整分数矩阵就需 `32 × 32768² × 2` 字节，即 64 GiB。这个估算不含模型权重、KV Cache 和其他张量，不能当成模型总显存。
 
-```text
-Prompt
-  → Q/K/V projection
-  → attention score(Q · Kᵀ)
-  → softmax
-  → weighted value aggregation
-  → output projection
-  → KV Cache 写入 / Decode 追加
-```
+![prefill 与注意力访存](../../public/topic_discussion/inference_optimization/prefill_attention_zh.svg)
 
-| 阶段 | Prefill 中发生什么 | 主要成本 | 可能影响的指标 |
-|:---|:---|:---|:---|
-| Q/K/V projection | 为整段 Prompt 生成 Q、K、V | 矩阵计算、权重读取 | Prefill time、TTFT |
-| Score 与 Softmax | 计算 token 两两关系并归一化 | 中间工作集、HBM 读写 | Attention time、peak memory |
-| Value aggregation | 按权重聚合 V 并输出 | 矩阵计算、片上复用 | Prefill time、TTFT |
-| KV Cache 写入 | 保存后续 Decode 需要的 K/V | Cache 容量、写入带宽 | peak memory、并发容量 |
+### FlashAttention：分块计算，避免保存完整分数矩阵
 
-这条数据流用于定位成本落点：FlashAttention 主要改变 Score、Softmax 和聚合的数据流；Prefix Cache 可能跳过部分重复 Prefill；Chunked Prefill 改变整段 Prompt 被送入执行队列的方式。三者不是同一种优化。
+FlashAttention 每次只算一个 Q 块对一个 K/V 块的分数。麻烦在于 softmax 的分母覆盖整行，不能对每块各自归一化后简单平均。online softmax（在线 softmax）为每行维护最大值、指数和及累计输出；新块到来时，先把旧状态缩放到新的最大值基准，再合并新块。
 
-![Prefill 与 Attention 访存](../../public/topic_discussion/inference_optimization/prefill_attention_zh.svg)
+例如分数 `[1,3,2,5]` 分成两块。第一块最大值是 3，第二块带来最大值 5，旧指数项便乘 `exp(3−5)`。不保存旧分数，也能得到整行 softmax 的结果。第 [20 节](../../02_PyTorch_Algorithms/20_FlashAttention_Sim.md)会手算并实现这个过程；已有基础可直接看[速查卡](../../02_PyTorch_Algorithms/20_FlashAttention_Sim.md#cheatsheet)。
 
-| 机制 | 主要改变什么 | 适合解决的问题 |
-|:---|:---|:---|
-| 标准 Attention + 完整 Prefill（基线） | 一次处理完整 Prompt，不分块、不复用前缀 | 建立 `TTFT`、Attention 时间和峰值显存参照 |
-| FlashAttention | Attention 的访存路径和中间结果写回 | Attention 计算受 HBM 读写拖慢 |
-| Chunked Prefill | 长 Prompt 的处理和调度方式 | 单次 Prefill 过大、影响其他请求 |
-| Prefix Cache | 重复前缀是否重新计算 | 多请求共享相同前缀，减少重复 Prefill |
+这仍是精确 attention 的数学计算，不是稀疏近似。它避免物化平方规模的分数矩阵，但没有把计算量变成线性；浮点实现还可能因累加顺序不同而产生误差。模型权重和 KV Cache 的容量问题仍然存在。
 
-三类机制的验证入口不同：FlashAttention 先验证 Attention 工作集和访存行为，Chunked Prefill 先验证长 Prompt 是否影响其他请求，Prefix Cache 先验证前缀是否命中。这里关注 Prefix Cache 对 Prefill 的影响；命中后的状态如何分页、失效、驱逐和治理，在正文 04 中继续展开。它们不能只用 `TTFT` 一个数字判断，因为一个机制可能降低单请求时间，另一个机制可能主要改善并发下的尾部延迟。
+### chunked prefill 与 prefix cache：何时算、是否需要再算
 
-### Prefill 与 Decode：同一 Attention 的不同工作负载
+假设一个请求有 8192 个输入 token，另一个请求正等待生成。chunked prefill（分块预填充）可以把长输入拆成若干调度片段，例如每片 1024 个位置，给其他请求穿插执行的机会。它改变调度粒度，不保证减少长请求自身的总计算量，也不保证它的 TTFT（首 token 延迟）更低。
 
-Prefill 和 Decode 使用相同的模型语义，但不是同一种性能问题。Prefill 一次处理较长的输入，通常包含更大的矩阵计算和更高的并行度；Decode 每轮只追加少量 token，却持续读取已有 KV Cache，更容易受到访存、调度和批次组织影响。因此不能用 Prefill 的优化结果直接推断 Decode 的 TPOT。
+再假设 10 个请求都有相同的 1000-token 系统提示。prefix cache（前缀缓存）有机会复用这段已计算的 K/V，省去重复 prefill。是否命中要看 token、模型和缓存条件，不能只凭两段文字意思相近判断。两条路线分别在 [38 阶段调度](../../02_PyTorch_Algorithms/38_Prefill_Decode_Scheduling.md)和 [24 前缀匹配](../../02_PyTorch_Algorithms/24_Prefix_Cache_Matching_and_Reuse.md)展开。
 
-| 阶段 | 输入形态 | 典型瓶颈 | 优先观察 |
-|:---|:---|:---|:---|
-| Prefill | 一次处理完整或分块 Prompt | Attention 工作集、矩阵计算、长 Prompt 阻塞 | TTFT、Prefill time、峰值显存、带宽 |
-| Decode | 每轮追加少量 token，读取历史 KV | KV 读取、批次组织、请求调度 | TPOT、P99、Cache 访问、有效推进量 |
+### SDPA：调用 API 后，究竟执行了什么
 
-如果问题从“首 token 很慢”转为“后续 token 间隔很大”，应从 Task1 的 Attention / Prefill 路径转向 Decode、KV Cache 或 Task4 调度路径，而不是继续只调 Prefill kernel。
+`scaled_dot_product_attention`（SDPA）是 PyTorch 的 attention API。运行时根据设备、dtype（数据类型）、shape（形状）、mask 和可用 backend（执行后端）选择实现，可选路径还随版本变化。调用成功只能说明得到了结果，不能单凭 API 名称认定用了 FlashAttention。
 
-| 候选机制 | 最小对照 | 关键证据 | 需要同时观察 |
-|:---|:---|:---|:---|
-| FlashAttention | 标准 Attention vs 分块实现 | Attention 时间、工作集或显存读写变化 | TTFT、peak memory、输出一致性 |
-| Chunked Prefill | 完整 Prefill vs 分块 Prefill | Prefill 被拆分后的调度行为 | TTFT、TPOT、P99、Decode 抖动 |
-| Prefix Cache | 不复用前缀 vs 命中前缀 | `hit_len`、`reused_tokens` | TTFT、命中率、Cache 占用 |
+例如同一份代码在受支持的 CUDA 低精度形状上可能走 flash，在另一配置上则走 math 等路径。先检查输出误差，再用 profiler（性能分析器）读取实际算子或 kernel（计算内核），最后比较延迟与峰值显存。[执行分派练习](../../02_PyTorch_Algorithms/INF-EXECUTION-DISPATCH_Inference_Fusion_and_Backend_Dispatch.md)用字典演示候选、能力检查和 fallback（回退）；真实选择仍由后端完成。
 
-Prefill 的时间还可以拆成三类成本：矩阵计算成本、HBM 与片上存储之间的数据搬运成本，以及 kernel launch、同步和形状处理带来的调度成本。Roofline 可以帮助判断算子更接近计算上限还是带宽上限，但它只提供定位假设；最终仍要用 kernel 时间、显存带宽、利用率和端到端 TTFT 验证。
+## 速查表
 
-| 成本来源 | 常见信号 | 优先检查 | 可能的动作 |
-|:---|:---|:---|:---|
-| 计算受限 | 算术强度较高，计算单元利用率高 | FLOPs、Tensor Core 路径、矩阵形状 | 调整 dtype、shape、kernel 或融合 |
-| 访存受限 | 带宽接近上限，计算单元未充分利用 | HBM 流量、工作集、读写次数 | 分块、片上复用、FlashAttention |
-| 启动/同步受限 | 单次 kernel 很短但 kernel 数量多 | launch 次数、空隙和同步点 | 融合、批处理、CUDA Graph 或编译优化 |
-| 形状受限 | 长度变化导致路径和性能抖动 | padding、bucket、动态 shape | 分桶、稳定 shape、重新组织 workload |
+<details>
+<summary>三类优化分别改变什么</summary>
 
-### SDPA、FlashAttention 与 backend dispatch
+| 优化 | 改变的对象 | 应查看什么 | 常见误判 |
+|---|---|---|---|
+| FlashAttention | attention 中间量读写与 kernel 组织 | 输出误差、实际路径、延迟、峰值显存 | 局部 attention 快就认为服务也快 |
+| chunked prefill | 一轮调度处理的长输入片段 | TTFT、TPOT、P99、迭代组成 | 拆块必然减少总计算 |
+| prefix cache | 重复前缀是否重新计算 | reused tokens、命中长度、TTFT、缓存占用 | 只看 TTFT 变化就认定命中 |
 
-在 PyTorch 推理路径中，`scaled_dot_product_attention`（SDPA）通常是统一的 Attention API；运行时会根据 dtype、shape、mask、设备和后端支持选择不同实现。FlashAttention 可以作为一种具体的高效 Attention 实现，但调用 SDPA 不等于已经确认使用了某个特定 kernel，必须通过 profiler、backend 日志或可复查的配置确认实际路径。
+</details>
 
-| 层次 | 负责什么 | 推理优化中要确认什么 |
-|:---|:---|:---|
-| Attention API | 表达缩放点积注意力的语义 | 输入 shape、mask、dtype 是否满足路径条件 |
-| SDPA dispatch | 根据运行条件选择实现 | 实际选择的 backend、fallback 原因和版本 |
-| FlashAttention kernel | 以分块和在线 Softmax 减少中间写回 | kernel 时间、工作集、带宽和输出一致性 |
-| 服务 backend | 将 Attention 放入 Prefill / Decode 和请求执行 | TTFT、TPOT、并发、峰值显存和 P99 |
+<details>
+<summary>区分计算、搬运与启动开销</summary>
 
-因此 Task1 的验证顺序是“语义正确 → 融合候选可识别 → dispatch 路径可确认 → kernel 证据可解释 → 请求指标可复测”。[INF-EXECUTION-DISPATCH](../../02_PyTorch_Algorithms/INF-EXECUTION-DISPATCH_Inference_Fusion_and_Backend_Dispatch.md)负责候选、能力门槛和 eager 回退；如果需要修改融合、Triton 或 CUDA kernel，应转入算子优化路线。
+| 信号 | 进一步核对 | 可以尝试 |
+|---|---|---|
+| 大矩阵算子占时长、计算利用率高 | dtype、形状、Tensor Core 路径 | 改善计算实现与形状 |
+| HBM 流量大、带宽利用率高 | 中间量大小、读写次数、算子时间 | 分块与片上复用 |
+| 很多短 kernel，之间空隙明显 | CPU 调度、同步点、启动次数 | 融合、编译或 CUDA Graph |
+| 长度改变时性能跳变 | padding、重编译、backend 切换 | 长度分桶与形状策略 |
 
-FlashAttention 的演进可以按“减少中间状态写回、提高并行效率、匹配硬件路径”理解。它们保持 Attention 的计算语义，主要改变 kernel 的数据流和执行方式；版本差异适合通过 kernel 时间、工作集、带宽和端到端 `TTFT` 验证，而不是只比较名称。
+</details>
 
-| 实现方式 | 主要变化 | 重点观察 |
-|:---|:---|:---|
-| 标准 Attention | 显式产生较大的中间矩阵 | 峰值显存、HBM 写回、工作集 |
-| FlashAttention | 分块计算、在线 Softmax、片上数据复用 | Attention 时间、带宽、TTFT |
-| FlashAttention 2 | 改进并行划分和线程块工作分配 | kernel 时间、GPU 利用率、形状敏感性 |
-| FlashAttention 3/4 路径 | 面向更新硬件的异步与低精度执行 | Tensor Core 路径、dtype、实际 GPU 证据 |
+这些只是排查线索，单个利用率不足以确定根因。对照时应保持模型、输入、硬件和请求压力一致。
 
-参考入口：论文 [FlashAttention](https://arxiv.org/abs/2205.14135)；开源实现 [FlashAttention](https://github.com/Dao-AILab/flash-attention)。
+## 选择条件
 
-## 选择条件与验证证据
+| 当前问题 | 先检查 | 下一步 |
+|---|---|---|
+| attention 临时显存过大 | 是否保存完整分数矩阵 | [20 速查卡](../../02_PyTorch_Algorithms/20_FlashAttention_Sim.md#cheatsheet) |
+| 配置了高效路径但没有加速 | 实际 backend、shape、首调成本 | [分派速查卡](../../02_PyTorch_Algorithms/INF-EXECUTION-DISPATCH_Inference_Fusion_and_Backend_Dispatch.md#cheatsheet) |
+| 长输入拖住正在生成的请求 | 调度片段与排队时间 | [07 Serving 调度](./07_serving_scheduling_and_pd.md) |
+| 很多请求共享前缀 | 缓存命中是否真实发生 | [04 KV Cache](./04_kv_cache_lifecycle_and_reuse.md) |
+| TTFT 高但 prefill 本身不慢 | 队列、传输与执行等待 | [01 请求链路](./01_request_path_and_metrics.md) |
 
-本节承接 `01` 的请求阶段和指标：先用 [20 FlashAttention Sim](../../02_PyTorch_Algorithms/20_FlashAttention_Sim.md) 理解 Attention 访存，再用 [INF-EXECUTION-DISPATCH](../../02_PyTorch_Algorithms/INF-EXECUTION-DISPATCH_Inference_Fusion_and_Backend_Dispatch.md) 检查融合候选、backend 能力与回退；重复前缀进入 [24 Prefix Cache](../../02_PyTorch_Algorithms/24_Prefix_Cache_Matching_and_Reuse.md)，长 Prompt 阻塞进入 [38 Prefill/Decode 调度](../../02_PyTorch_Algorithms/38_Prefill_Decode_Scheduling.md)，最终在 [66 Inference Performance Comparison](../../02_PyTorch_Algorithms/66_Inference_Performance_Comparison.md) 中固定 workload 复测。
+## 相关阅读
 
-| 观察到的现象 | 优先判断 | 下一步 |
-|:---|:---|:---|
-| Prompt 变长时 `TTFT` 持续升高 | Prefill 或 Attention 访存受限 | 检查 FlashAttention 和硬件支持 |
-| 长 Prompt 阻塞其他请求 | 单次 Prefill 影响调度 | 检查 Chunked Prefill |
-| 多请求包含相同前缀 | 重复计算占主要成本 | 检查 Prefix Cache |
-| `TTFT` 高但 Prefill 占比不高 | 排队、batch 组装或服务调度 | 进入 `04` / `06` |
+- [FlashAttention 论文](https://arxiv.org/abs/2205.14135) —— IO 分析与分块算法。
+- [FlashAttention 官方实现](https://github.com/Dao-AILab/flash-attention) —— 硬件与版本支持。
+- [PyTorch SDPA](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html) —— 输入语义与后端约束。

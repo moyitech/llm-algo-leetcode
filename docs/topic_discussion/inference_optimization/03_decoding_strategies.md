@@ -2,69 +2,74 @@
 
 ## 学习问题
 
-从首 token 之后的生成循环开始，观察单条请求每轮如何读取已有 KV 状态、产生输出，再比较生成策略对速度、质量和额外成本的影响。
+首个 token（词元）已经出来，后面的回答却一字一顿。是采样设置的问题，还是模型每次只能推进一个位置？本页先解释怎样选择下一个 token，再比较一轮推进多个位置的方法。输出质量、分布和速度需要分别检查。
 
 ## 核心机制
 
-Decode 是一轮一轮的小步生成：每一步读取已有 KV 状态，得到 logits，再选择下一个 token，并把新的 token 和状态追加到序列中。先用贪心解码建立基线；再把投机式生成看成一条策略链：经典 draft / target 验证、多个 token 推进与更一般的多候选验证，目标都是提高每轮有效推进量。本页重点是单条请求的生成决策；多个请求如何组织执行，放到 Task4 的调度正文中。
+### 从一张 logits 到下一个 token
 
-这里的“加速”不是简单地减少模型调用次数，而是提高每次验证真正提交的 token 数。可以用 `effective_output_tokens / decode_step` 表示单轮有效推进量；它必须和 `acceptance_rate`、验证耗时、回退次数以及最终质量一起观察。这样才能区分“候选更多”与“有效生成更多”。
+模型每步给出 logits（未归一化词表分数）。greedy（贪心）取最大值；sampling（采样）先形成概率分布，再随机选择。temperature（温度）缩放分差，top-k 限制名额，top-p 限制候选集合覆盖的概率质量。它们作用于选择阶段，不会因为温度调低就减少模型层数或 KV Cache（键值缓存）。
 
-![Decode 策略对照](../../public/topic_discussion/inference_optimization/decode_strategies_zh.svg)
+例如概率 `[0.5,0.3,0.1,0.05,0.05]`、top-p=0.85，应保留累计达到 0.9 的前三项，而不是删掉让累计越过阈值的第三项。第 [21 节](../../02_PyTorch_Algorithms/21_Decoding_Strategies.md)实现这些操作，并解释 `cumsum > p` 后右移的等号边界约定；可从[速查卡](../../02_PyTorch_Algorithms/21_Decoding_Strategies.md#cheatsheet)快速回顾。
 
-| 策略 | 主要改变什么 | 需要观察什么 |
-|:---|:---|:---|
-| 贪心 Decode（基线） | 每轮选择 logits 最大的一个 token | 输出长度、TPOT、KV Cache 访问、质量 |
-| 随机采样 | 按 temperature、top-k / top-p 选择 token | 质量、重复率、TPOT、输出稳定性 |
-| 经典投机解码 | draft 提议、target 验证与修正 | acceptance rate、验证成本、TPOT |
-| 原生 MTP | verifier 内部多 Token 预测模块提出候选 | 原生头数、接受长度、backend 命中 |
-| EAGLE | 外置轻量草稿器复用目标模型隐藏表示 | 候选树、draft cost、配对 checkpoint |
-| 块级并行草稿（DFlash） | block diffusion 一次提出 token block | block 接受率、draft cost、verify cost |
-| 半自回归草稿（DSpark） | 置信度驱动地决定候选推进与验证预算 | confidence、proposal budget、负载下 TPOT |
-| Decode Scheduling | 不同请求的执行顺序，属于 Task4 的请求级调度 | 吞吐、TPOT、P99 |
+比较加速方案时，需要保持目标生成规则一致。改 temperature 或输出长度也可能改变耗时，但那不再是同一生成任务下的对照。
 
-单请求的 Decode 可以按“读取状态 → 计算 logits → 选择 token → 检查停止 → 追加状态”理解。策略改变的是其中的候选生成、验证或单轮产出；它不会自动消除 KV Cache 的容量约束，也不能用吞吐提升替代质量检查。比较 speculative decoding 或 multi-token decoding 时，还要记录接受情况和回退成本。
+### draft 先猜，target 批量验证
 
-| 生成环节 | 需要回答的问题 | 证据 |
-|:---|:---|:---|
-| 读取状态 | 本轮使用了哪些历史 KV？ | Cache 长度、TPOT、读写量 |
-| 选择 token | 是贪心、采样，还是 draft 提议后验证？ | temperature、top-k/top-p、acceptance rate |
-| 停止与回退 | 何时遇到 EOS，何时拒绝候选？ | generated tokens、停止原因、回退次数 |
-| 质量与成本 | 更快是否保持了目标质量？ | 质量指标、TPOT、吞吐、额外模型成本 |
+小 batch 的 decode（解码）常受权重和 KV 读取限制：读取很多数据，却只推进一个位置。speculative decoding（投机解码）让 draft（草稿器）先猜 K 个 token，再由 target（目标模型）批量验证，以额外草稿成本换取更少的串行 target 前向。
 
-生成策略的比较需要把“可重复性”和“质量门槛”一起固定。贪心 Decode 适合作为确定性基线；采样实验应固定随机种子和采样参数；speculative decoding 还要记录 draft 与 target 的版本、接受率和拒绝后的回退路径。只有在输出质量达到同一门槛后，TPOT 或吞吐的改善才可以作为性能收益。
+例如候选 `[4,5,6]`，贪心 target 在对应位置给出 `[4,5,9,8]`。前两个匹配，第三个不同，于是输出 `[4,5,9]` 并结束本轮。后续候选建立在已经被拒的前文上，不能继续提交。全部匹配时还可输出一个 bonus token（额外 token）；EOS 和长度上限可能提前结束生成。
 
-### 候选生成的两条扩展路径
+采样路径需要概率修正。若同一上下文下 draft 与 target 分布为 q、p，接受候选 x 的概率是 `min(1,p(x)/q(x))`；拒绝后从 `normalize(max(0,p−q))` 抽修正 token。例如 `q(B)=0.6`、`p(B)=0.3`，B 只接受一半，防止 draft 过度输出它。第 [23 节](../../02_PyTorch_Algorithms/23_Speculative_Decoding.md)用四词例子推导最终分布为什么仍是 p。
 
-经典 speculative decoding 的草稿阶段仍然通常按 token 自回归推进。原生 MTP 将预测模块放在 verifier checkpoint 内部；EAGLE 复用目标模型的隐藏表示，用外置轻量草稿器自回归扩展候选树；DFlash 则将轻量 block diffusion 模型用于并行产生一个候选 block。三者改变的是候选来源与生成拓扑，不改变“验证—接受—回退”的证据要求。[EAGLE-3 论文](https://arxiv.org/abs/2503.01840)、[DFlash 论文](https://arxiv.org/abs/2602.06036)和[vLLM Speculators 算法指南](https://docs.vllm.ai/projects/speculators/en/latest/user_guide/algorithms/decision_guide/)给出了对应实现背景。
+分布等价不保证两次随机运行生成相同字符串。实际低精度、累加顺序和近并列 argmax 还会影响逐 token 复现，不能因算法叫“无损”就跳过输出检查。
 
-DSpark 进一步采用半自回归候选生成，并用置信度调度候选长度和验证预算。它同时连接了 Task2 的候选生成机制与 Task4 的服务调度：在单请求中观察置信度和有效推进量，在多请求中还要观察队列等待、TPOT 和尾延迟。[DSpark 论文](https://arxiv.org/abs/2607.05147) 和 [vLLM Speculators 中的 DSpark 文档](https://docs.vllm.ai/projects/speculators/en/latest/user_guide/algorithms/dspark/) 可用于了解实现入口。
+### 候选从哪里来：三个扩展分支
 
-| 扩展路径 | 候选生成方式 | Task2 重点 | Task4 交叉问题 |
-|:---|:---|:---|:---|
-| 原生 MTP | verifier 内部预测层提出连续候选 | 模型能力检查、连续接受与验证成本 | backend 是否支持原生 MTP |
-| EAGLE | 多层表示融合后自回归扩展候选树 | 候选树宽深、draft cost、checkpoint 配对 | 树宽与 batch / KV 预算 |
-| DFlash | block diffusion 并行提出候选 block | block 长度、接受前缀、verify 成本 | batch 中不同请求的 block 预算 |
-| DSpark | 半自回归 + 置信度调度 | 置信度、候选长度、回退语义 | 高负载下的动态 speculation budget |
+**原生 MTP（多 token 预测）** 把预测模块放进 checkpoint，复用主模型隐藏状态。第 [35 节](../../02_PyTorch_Algorithms/35_Multi_Token_Decoding.md)从给定的各深度 logits 组成候选块，练习连续贪心验证。真实多步生成取决于模型和 backend（执行后端），不能把模块层数当成所有实现的候选上限。
 
-| 对照条件 | 应固定的内容 | 额外记录 |
-|:---|:---|:---|
-| 贪心基线 | 模型、Prompt、最大输出长度、停止条件 | 输出 token、TPOT、E2E、质量基线 |
-| 随机采样 | seed、temperature、top-k/top-p、Prompt 集 | 重复率、格式成功率、质量分布 |
-| 经典投机解码 | draft/target 模型、proposal 长度、验证规则 | acceptance rate、回退次数、额外显存 |
-| 多 Token 投机式推进 | 候选来源、单轮候选数量、接受与回退规则 | 有效推进、验证成本、TPOT |
-| EAGLE | verifier / speculator 配对、树宽深、隐藏层配置 | 接受长度、draft cost、树验证成本 |
-| DFlash / DSpark | draft family、proposal mode、候选预算、置信度规则 | block 接受率、draft/verify cost、负载下 TPOT |
+**EAGLE** 为特定 target 训练轻量 drafter，复用隐藏特征和 token embedding（嵌入）。候选可组织成树，target 用 tree attention（树注意力）限制每条分支的可见上下文，再按相应算法验证。[EAGLE 练习](../../02_PyTorch_Algorithms/INF-EAGLE_Feature_Drafter_and_Candidate_Tree.md)只演示简化融合和路径打分；draft 的高分不等于 target 接受率。
 
-参考入口：论文 [Fast Inference from Transformers via Speculative Decoding](https://arxiv.org/abs/2211.17192)；开源实现 [vLLM Speculative Decoding](https://docs.vllm.ai/en/latest/features/speculative_decoding/)。DFlash 和 DSpark 作为候选生成与动态预算的扩展，不要求在本页重写真实 draft model。
+**DFlash / DSpark** 减少草稿主干的串行等待。DFlash 用块扩散网络并行出候选，DSpark 在并行主干后加轻量顺序修正和接受置信度预测。[并行草稿练习](../../02_PyTorch_Algorithms/INF-PARALLEL-DRAFTING_DFlash_and_DSpark.md)从给定分数手算这些操作。置信度 `[0.9,0.8,0.3,0.95]`、阈值 0.5 时只送前两个位置验证，不能跨过中间缺口取最后一个。
 
-## 选择条件与验证证据
+这些是不同的候选来源，不必按顺序全部部署；无论选哪条路，target 验证都不可省略。
 
-本节承接 `02` 的 Prefill 与 Attention，先用 [21 Decoding Strategies](../../02_PyTorch_Algorithms/21_Decoding_Strategies.md)建立单步生成口径，再用 [23 Speculative Decoding](../../02_PyTorch_Algorithms/23_Speculative_Decoding.md)固定精确验证。候选生成分成三条路径：[35 原生 MTP](../../02_PyTorch_Algorithms/35_Multi_Token_Decoding.md)、[INF-EAGLE](../../02_PyTorch_Algorithms/INF-EAGLE_Feature_Drafter_and_Candidate_Tree.md)和[INF-PARALLEL-DRAFTING](../../02_PyTorch_Algorithms/INF-PARALLEL-DRAFTING_DFlash_and_DSpark.md)；[INF-PROPOSAL](../../02_PyTorch_Algorithms/INF-PROPOSAL_Dynamic_Proposal_and_Verification_Budget.md)再统一预算与净收益。随后由 [68 Benchmark](../../02_PyTorch_Algorithms/68_Speculative_Decoding_Benchmark.md)固定真实模型的质量与成本口径，最后通过 [36 Decode Scheduling](../../02_PyTorch_Algorithms/36_Decode_Scheduling.md)进入多请求组织。
+### 预算与成本：猜得多不一定快
 
-| 观察到的现象 | 优先判断 | 下一步 |
-|:---|:---|:---|
-| 每轮生成耗时高 | Decode 计算、KV Cache 访问或 sampling | 检查基础 Decode 和 `04` |
-| 循环次数过多 | 生成长度或单轮产出受限 | 检查 speculative / multi-token |
-| acceptance rate 低 | draft model 或 proposal 不匹配 | 调整 draft、长度或放弃策略 |
-| 多请求吞吐低、P99 高 | 请求组织或调度问题 | 进入 `07` / `06` |
+假设 draft 每个候选花 3 ms，一次验证花 12 ms，K=5 就需 27 ms。如果只接受两个候选，而 baseline（基线）逐 token 花 10 ms，仅这两个候选节省的 20 ms 还不够支付成本。完整对照还要计入修正或 bonus 对应的输出量，以及调度、状态更新等耗时。这些是假设数字，说明接受率本身不能决定收益。
+
+[动态预算练习](../../02_PyTorch_Algorithms/INF-PROPOSAL_Dynamic_Proposal_and_Verification_Budget.md)按近期接受率调整 K，并解释部分成本估算的边界。轮内置信度截断则在本轮候选不够可信时提前停止。前者看历史，后者看当下，最终都要用延迟、质量和资源占用检验。
+
+## 速查表
+
+<details>
+<summary>候选来源与额外成本</summary>
+
+| 来源 | 复用什么 | 新增成本或限制 | 快速查阅 |
+|---|---|---|---|
+| 外置 draft model | 自己的 KV Cache | 额外权重、缓存与串行草稿计算 | [23](../../02_PyTorch_Algorithms/23_Speculative_Decoding.md#cheatsheet) |
+| 原生 MTP | 主模型隐藏状态 | checkpoint 模块与 backend 支持 | [35](../../02_PyTorch_Algorithms/35_Multi_Token_Decoding.md#cheatsheet) |
+| EAGLE | 配对 target 的特征 | drafter 训练、配对与树验证 | [INF-EAGLE](../../02_PyTorch_Algorithms/INF-EAGLE_Feature_Drafter_and_Candidate_Tree.md#cheatsheet) |
+| DFlash / DSpark | target 条件与并行主干输出 | 专用资产、顺序头与置信度校准 | [并行草稿](../../02_PyTorch_Algorithms/INF-PARALLEL-DRAFTING_DFlash_and_DSpark.md#cheatsheet) |
+
+</details>
+
+## 选择条件
+
+| 现象 | 优先检查 | 下一步 |
+|---|---|---|
+| 输出重复或采样不可复现 | 生成规则、种子与数值环境 | [21 解码策略](../../02_PyTorch_Algorithms/21_Decoding_Strategies.md) |
+| 接受率高但延迟未降 | draft、verify、调度各自成本 | [动态预算速查卡](../../02_PyTorch_Algorithms/INF-PROPOSAL_Dynamic_Proposal_and_Verification_Budget.md#cheatsheet) |
+| 首次拒绝总在前几个位置 | 模型配对、tokenizer、采样规则 | [23 验证规则](../../02_PyTorch_Algorithms/23_Speculative_Decoding.md#cheatsheet) |
+| 长草稿后半段总浪费 | 顺序依赖与预算 | [并行草稿与置信前缀](../../02_PyTorch_Algorithms/INF-PARALLEL-DRAFTING_DFlash_and_DSpark.md#cheatsheet) |
+| 单请求快，高并发却慢 | 候选占用、批处理和 KV 预算 | [07 Serving 调度](./07_serving_scheduling_and_pd.md) |
+
+真实模型对照进入 [68 投机解码基准](../../02_PyTorch_Algorithms/68_Speculative_Decoding_Benchmark.md)。保持 target、输入、生成规则和质量要求一致，同时记录延迟、有效推进量、额外显存及失败。各节是否已有测量、是否仅检查了配对条件，见[实验资产表](./experiment_assets.md)。
+
+## 相关阅读
+
+- [Speculative Decoding](https://arxiv.org/abs/2211.17192) —— 接受与修正的推导。
+- [DeepSeek-V3](https://arxiv.org/abs/2412.19437) —— 原生 MTP 训练与推理。
+- [EAGLE-3](https://arxiv.org/abs/2503.01840) —— 多层特征与训练目标。
+- [DFlash](https://arxiv.org/abs/2602.06036) —— 块扩散草稿。
+- [DSpark 算法文档](https://docs.vllm.ai/projects/speculators/en/latest/user_guide/algorithms/dspark/) —— 顺序头与置信头。

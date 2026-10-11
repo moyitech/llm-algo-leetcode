@@ -8,12 +8,14 @@ tools/convert_notebook.py.
 
 from __future__ import annotations
 
+import re
 import shutil
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCS = ROOT / "docs"
+NOTEBOOK_LINK_RE = re.compile(r"(\]\([^)\s]+)\.ipynb(#[^)\s]*)?\)")
 
 
 NAV_FILES = {
@@ -114,7 +116,7 @@ def sync_navigation() -> None:
                 continue
             dst = dst_dir / name
             text = src.read_text(encoding="utf-8")
-            mirrored = text.replace(".ipynb)", ".md)")
+            mirrored = NOTEBOOK_LINK_RE.sub(r"\1.md\2)", text)
             # Source topic pages may link to docs/guide.md. Once mirrored
             # inside docs/topic_discussion, guide.md is already at the docs
             # root, so remove the extra docs/ segment in the mirror only.

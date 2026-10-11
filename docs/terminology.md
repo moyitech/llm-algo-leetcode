@@ -1,19 +1,40 @@
 # 术语表与中英文写作规范
 
-> 统一审阅入口见 [教程资产总登记与审阅台账](./asset_registry.md)。
+> 统一审阅入口见 [维护与发布手册](./maintenance.md)。
 
-本文统一教程的中文术语、英文写法和常用缩写。正文首次出现使用“中文（English）”；代码、字段名、官方 API、模型名、库名和协议名保留英文。后续使用表中的规范中文或通用缩写，避免同一概念在不同 Part 中漂移。
+本文统一教程的术语写法和常用缩写。目标读者是会写 PyTorch、日常用英文术语交流的工程师，所以**行业通用术语直接写英文**，每页首次出现时加一次中文括注，之后只写英文。代码、字段名、官方 API、模型名、库名和协议名保留英文。表中"中文"列用于括注和术语表检索，不是正文里的主称。
 
 ## 使用规则
 
-- 英文缩写已成为行业通用表达时，可在首次释义后直接使用，例如 KV Cache、TTFT、DPO、MoE。
-- `workload`、`artifact`、`manifest`、`trace`、`profile` 等项目字段保留英文键名；正文使用对应中文解释。
-- `checkpoint` 是名词；表示“采用激活检查点机制”时统一写“激活检查点（activation checkpointing）”。
-- `offload` 在正文统一译为“卸载”；若需强调方向，可写“卸载到 CPU / NVMe”。
+- 行业通用术语（token、prefill、decode、KV Cache、logits、batch、workload、backend、kernel、decoder-only、draft / verify / accept、SDPA、TTFT、DPO、MoE 等）正文直接写英文；每页首次出现写成 `prefill（预填充）`，之后只写 `prefill`。
+- 有稳定中文说法且中文更自然的概念（反向传播、梯度累积、混合精度、显存、吞吐、尾延迟、量化、校准）用中文主称，首次出现可括注英文。
 - 不把库名、后端名或模型名翻译，例如 PyTorch、vLLM、SGLang、Triton、CUDA、Qwen。
-- 学习者正文使用中文概念，代码标识符保留原文。例如写“调用 `backward()` 执行反向传播”，不写“backward 计算 gradient”。
-- 页内首次出现的专业概念使用“中文（English / 缩写）”；后续使用中文规范名或通用缩写。H1 可以保留双语标题，内部标题不重复堆叠中英文。
-- 表格和图片遵循与正文相同的规范；若要展示字段或 API，使用反引号或代码样式将其与概念名称区分。
+- `workload`、`artifact`、`manifest`、`trace`、`profile`、`evidence_level` 等项目字段在代码和结果 JSON 中保留英文键名；正文第一次出现时解释含义（"workload 指写死的输入、配置和运行条件"）。
+- `checkpoint` 是名词；表示"采用激活检查点机制"时统一写"activation checkpointing（激活检查点）"。
+- `offload` 正文写 "offload 到 CPU / NVMe"；不单独译作"卸载"。
+- 代码标识符用反引号与正文概念区分：写"调用 `backward()` 执行反向传播"，不写"backward 计算 gradient"。
+- H1 保留 `# NN. English Title | 中文标题` 双语格式（转换脚本依赖 ASCII ` | `）；内部标题不重复堆叠中英文。
+- 表格和图片遵循与正文相同的规范。
+
+## 禁用词
+
+避免用下面这些抽象表达代替技术解释，尤其是“证据出口”“收口”“准入结论”等项目内部说法。这里约束的是用法，不是字面词频：首次中文括注、原始资料标题、代码标识符与 JSON 字段保留原文；“固定随机种子”、接口契约、数学证明中的不变量等有明确含义的表达可以保留。不要为了替换词语而使句子更难读。
+
+| 禁用 | 改用 |
+| --- | --- |
+| 证据出口 / 验证出口 | 去哪里验证："在 68 里用真实模型跑一遍" |
+| 准入 / 准入结论 | 能不能上线 / 是否采用 |
+| 收口 | 汇总 / 最后在 X 比较 |
+| 口径 | 同样条件下 / 统一指标定义 |
+| 账本 | 统计表 / 把 X 加起来 |
+| 契约（接口定义之外） | 约定 / 必须满足的条件 |
+| 复测 | 再跑一次 / 重新测量 |
+| 机制页 / 项目页 | 本节 / 第 68 节（项目） |
+| 工作负载 | workload（首次括注"写死的输入和配置"） |
+| 词元 / 预填充 / 仅解码器 | token / prefill / decoder-only |
+| 不变量（解析中） | 必须始终成立的条件，或直接写条件本身 |
+| 固定（作动词） | 写死 / 保持不变 / 先确定 |
+| 证据（泛用） | 结果 / 测量值 / 测试 |
 
 ## 基础张量、训练与数值
 
@@ -74,33 +95,55 @@
 
 ## 推理、KV Cache 与服务
 
-| 中文规范名 | English / 缩写 | 推荐写法 | 不建议混用 |
+本节术语在正文中直接写英文，首次出现加中文括注。
+
+| English / 缩写 | 中文（括注用） | 推荐写法 | 容易混淆之处 |
 | --- | --- | --- | --- |
-| 提示词 | prompt | prompt token、请求输入 | prompt 与完整 request 不加区分 |
-| 预填充 | prefill | prefill 处理输入 token 并建立状态 | 首次前向、prompt 阶段混用 |
-| 解码 | decode | decode 自回归生成 token | 生成、推理阶段混用 |
-| 键值缓存 | key-value cache / KV Cache | KV Cache 缓存历史 K/V | KV cache、kv cache 大小写漂移 |
-| 分页注意力 | PagedAttention | 用 block table 管理 KV Cache | 分页 Cache、PagedAttention 混用 |
-| 前缀缓存 | prefix cache | 复用共享前缀的已计算状态 | 共享前缀、公共前缀缓存混用 |
-| 连续批处理 | continuous batching | 迭代级动态加入 / 移除请求 | dynamic batching 不加说明 |
-| 分块预填充 | chunked prefill | 将长 prefill 分块与 decode 交错 | chunk prefill、分段推理混用 |
-| 投机解码 | speculative decoding | draft 提案、target 验证并修正 | 推测采样、投机推理混用 |
-| 草稿模型 / 目标模型 | draft model / target model | draft 生成候选，target 验证 | baseline / candidate 取代模型角色 |
+| token | 词元 | "每步生成一个 token"；不写"词元" | 与字符、词、subword 不加区分 |
+| logits | 词表分数 | 模型最后一层输出的未归一化分数，形状 `[vocab_size]` | 与概率混用；logits 没有归一化 |
+| decoder-only | 仅解码器 | "decoder-only 模型的自回归生成" | 与 encoder-decoder 的解码阶段混用 |
+| prompt | 提示词 | prompt token、请求输入 | prompt 与完整 request 不加区分 |
+| prefill | 预填充 | 处理输入 token 并建立 KV Cache，也可按调度预算分块 | 不等于 TTFT 的全部时间 |
+| decode | 解码 | decode 每步读取 KV Cache 追加一个 token | 生成、推理阶段混用 |
+| KV Cache | 键值缓存 | KV Cache 缓存历史 K/V | KV cache、kv cache 大小写漂移 |
+| greedy / sampling | 贪心 / 采样 | greedy 取 argmax；sampling 从分布抽取 | 有限低温不等于显式 greedy；唯一最大值下趋零极限另论 |
+| temperature | 温度 | logits 除以 T 再 softmax；T<1 更尖，T>1 更平 | 以为 temperature 改变排序 |
+| top-k / top-p | 候选截断 / 核采样 | 按排名或累计概率质量过滤；21 的 top-k 包含阈值并列项，top-p 保留至累计首次 > p（p=1 不截断） | 等号边界、并列与最少保留数需核对具体实现 |
+| speculative decoding | 投机解码 | draft 提案、target 一次验证并修正 | 推测采样、投机推理混用 |
+| draft / target model | 草稿模型 / 目标模型 | draft 生成候选，target 验证 | baseline / candidate 取代模型角色 |
+| draft / verify / accept / correct | 草稿 / 验证 / 接受 / 修正 | 接受概率 α = min(1, p/q)；拒绝后从 norm(max(0, p−q)) 重采样 | 把"拒绝后重采样"写成"交还 target 重新生成" |
+| acceptance length | 接受长度 | 一轮验证中被接受的 draft token 数 | 与接受率（比例）混用 |
+| lookahead / k | 草稿步数 | 每轮 draft 提出的候选数 | 与 beam width 混用 |
+| MTP (multi-token prediction) | 多 token 预测 | checkpoint 内的预测模块提供额外位置的候选 | 真实多步执行依赖 backend，候选步数不总等于模块层数 |
+| EAGLE | — | 复用 target 隐藏表示的轻量 drafter + 候选树 | 把 EAGLE 当成独立小模型 |
+| candidate tree | 候选树 | 一轮验证多条候选路径 | 与 beam search 混用 |
+| DFlash / DSpark | — | 块扩散草稿；DSpark 增加轻量顺序修正与接受置信度预测 | 逐行 argmax 的教学示例不是完整扩散模型 |
+| verification budget | 验证预算 | 一轮验证允许的候选数或计算量 | 与 lookahead k 等同 |
+| PagedAttention | 分页注意力 | 用 block table 管理 KV Cache | 分页 Cache、PagedAttention 混用 |
+| prefix cache | 前缀缓存 | 复用共享前缀的已计算状态 | 共享前缀、公共前缀缓存混用 |
+| continuous batching | 连续批处理 | 迭代级动态加入 / 移除请求 | dynamic batching 不加说明 |
+| chunked prefill | 分块预填充 | 将长 prefill 分块与 decode 交错 | chunk prefill、分段推理混用 |
+| online softmax | 在线 softmax | 分块扫描时维护 running max 和 running sum | 与 safe softmax（只减 max）混用 |
+| SDPA | 缩放点积注意力 API | `torch.nn.functional.scaled_dot_product_attention` | 把 SDPA 当成 FlashAttention 本身 |
+| attention backend (flash / mem-efficient / math) | 注意力后端 | SDPA 按 shape、dtype、mask 自动选择 backend | 以为开了 SDPA 就一定走 flash |
+| fusion / dispatch / fallback | 融合 / 分派 / 回退 | 候选过 backend 能力检查才走编译 kernel，否则 fallback 到 eager | 把 fallback 当成失败 |
+| eager / compiled | 即时执行 / 编译执行 | eager 逐算子执行；compiled 经 `torch.compile` 融合 | 与 CPU / GPU 混用 |
+| backend | 后端 | vLLM、SGLang 等执行后端 | 模型、框架、runtime 混用 |
 
 ## 性能、显存、I/O 与 profiling
 
 | 中文规范名 | English / 缩写 | 推荐写法 | 不建议混用 |
 | --- | --- | --- | --- |
-| 工作负载 | workload | 固定输入、配置与运行条件组成 workload | 测试数据、任务、实验设置混用 |
+| workload | workload | 正文直接写 workload，首次括注"写死的输入、配置与运行条件" | 测试数据、任务、实验设置混用；不写"工作负载" |
 | 基线 / 候选 | baseline / candidate | 相同 workload 下比较 baseline 与 candidate | 对照组、方案、模型角色不明确 |
 | 探针 | probe | 验证局部接口或现象的 GPU probe | 将 probe 当成端到端 benchmark |
 | 冒烟测试 | smoke test | 验证环境、接口或最小路径可运行 | 将 smoke 结果写成性能结论 |
 | 基准测试 | benchmark | 固定 workload 的可比较测量 | 测试、benchmark 混用 |
 | 性能分析 | profiling | 聚合热点、资源使用与瓶颈 | profile 与 trace 完全等同 |
 | 时间线追踪 | trace | 带时间戳的事件与依赖关系 | trace、日志、profile 混用 |
-| 性能回归 | performance regression | 同口径下性能或质量变差 | 单次波动即称回归 |
+| 性能回归 | performance regression | 同样条件下性能或质量变差 | 单次波动即称回归 |
 | 激活检查点 | activation checkpointing | 以重算降低 activation 峰值显存 | checkpoint / checkpointing 混用 |
-| 卸载 | offload | 将状态卸载到 CPU / NVMe | 迁移、搬运、卸载不加方向 |
+| offload | offload | offload 到 CPU / NVMe | 迁移、搬运、卸载不加方向 |
 | 输入输出 | input/output / I/O | 输入搬运、artifact 加载、状态传输、输出回写 | 仅把磁盘读写称为 I/O |
 | 首 token 延迟 | time to first token / TTFT | TTFT 衡量首次输出等待 | 与端到端延迟等同 |
 | 单 token 时间 | time per output token / TPOT | TPOT 衡量后续生成节奏 | 与首 token 延迟混用 |

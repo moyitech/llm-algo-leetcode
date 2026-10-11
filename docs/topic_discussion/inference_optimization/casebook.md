@@ -7,7 +7,7 @@
 统一判断链是：
 
 ```text
-现象 → 请求阶段 → 瓶颈对象 → 策略代价 → 证据出口
+现象 → 请求阶段 → 瓶颈对象 → 策略代价 → 验证位置
 ```
 
 本专题重点关注 Infra-L2–L4 的执行效率；模型版本治理、灰度发布、扩缩容和流量治理属于 Infra-L5，不在这份判断手册展开。
@@ -51,16 +51,32 @@
 
 如果还不能确定瓶颈对象，先使用下面的现象表定位阶段；已经确认属于 Cache 问题后，再使用上面的 Cache 角色表选择具体机制。
 
-| 现象 | 先判断的对象 | 优先策略 | 主要指标 | 验证出口 |
+| 现象 | 先判断的对象 | 优先策略 | 主要指标 | 去哪里验证 |
 |:---|:---|:---|:---|:---|
 | 长 prompt 下首 token 明显变慢 | prefill 计算与访存 | FlashAttention、chunked prefill、prefix cache | TTFT、prefill 时间、峰值显存 | [02 Prefill](./02_prefill_and_attention_kernel.md) |
 | 单请求生成阶段每 token 很慢 | decode 计算和 KV 读取 | speculative decoding、multi-token decoding | TPOT、接受率、质量 | [03 Decode](./03_decoding_strategies.md) |
 | 并发增加后生成速度下降 | decode 调度和 GPU 利用率 | decode scheduling、continuous batching | TPOT、吞吐、P99、GPU 利用率 | [03 Decode](./03_decoding_strategies.md) / [07 Serving](./07_serving_scheduling_and_pd.md) |
 | cache 持续增长，并发上不去 | KV Cache 容量与组织 | paging、prefix reuse、eviction | cache 容量、命中率、并发、峰值显存 | [04 KV Cache](./04_kv_cache_lifecycle_and_reuse.md) |
 | 显存下降但交互体验变差 | 量化或缓存策略的代价 | 区分权重量化、KV Cache 量化和调度影响 | TTFT、TPOT、吞吐、质量、显存 | [05 Quantization](./05_quantized_inference_and_deployment.md) / [06 Benchmark](./06_benchmark_and_decision.md) |
+| 接受率高但生成没有更快 | 草稿与验证的额外成本 | 缩短预算、减少草稿成本，重新测量 | 接受长度、draft/verify 时间、端到端延迟 | [动态预算](../../02_PyTorch_Algorithms/INF-PROPOSAL_Dynamic_Proposal_and_Verification_Budget.md#cheatsheet) |
 | backend 能加载但收益不稳定 | kernel、格式或运行时路径 | 对齐 backend、dtype、workload 和版本 | 格式、kernel、延迟、吞吐、质量 | [06 Benchmark](./06_benchmark_and_decision.md) |
 
-## 证据与项目决策
+## 机制速查索引
+
+已知道机制名称时，用本表直接跳到练习或速查卡。速查卡概括公式与常见坑，完整因果解释保留在章节正文。
+
+| 机制 | 一句话 | 章节 | 速查卡 |
+|---|---|---|---|
+| FlashAttention / online softmax | 分块扫描并重标定行统计量 | [20](../../02_PyTorch_Algorithms/20_FlashAttention_Sim.md) | [直达](../../02_PyTorch_Algorithms/20_FlashAttention_Sim.md#cheatsheet) |
+| fusion / dispatch / fallback | 检查候选与后端能力，选择兼容路径 | [INF-EXECUTION-DISPATCH](../../02_PyTorch_Algorithms/INF-EXECUTION-DISPATCH_Inference_Fusion_and_Backend_Dispatch.md) | [直达](../../02_PyTorch_Algorithms/INF-EXECUTION-DISPATCH_Inference_Fusion_and_Backend_Dispatch.md#cheatsheet) |
+| temperature / top-k / top-p | 调整分布、过滤候选，再选择 token | [21](../../02_PyTorch_Algorithms/21_Decoding_Strategies.md) | [直达](../../02_PyTorch_Algorithms/21_Decoding_Strategies.md#cheatsheet) |
+| speculative decoding | 草稿经接受、拒绝和修正后提交 | [23](../../02_PyTorch_Algorithms/23_Speculative_Decoding.md) | [直达](../../02_PyTorch_Algorithms/23_Speculative_Decoding.md#cheatsheet) |
+| native MTP | 复用模型内预测模块形成有序候选 | [35](../../02_PyTorch_Algorithms/35_Multi_Token_Decoding.md) | [直达](../../02_PyTorch_Algorithms/35_Multi_Token_Decoding.md#cheatsheet) |
+| EAGLE / candidate tree | 用配对特征形成候选树，再由 target 验证 | [INF-EAGLE](../../02_PyTorch_Algorithms/INF-EAGLE_Feature_Drafter_and_Candidate_Tree.md) | [直达](../../02_PyTorch_Algorithms/INF-EAGLE_Feature_Drafter_and_Candidate_Tree.md#cheatsheet) |
+| DFlash / DSpark | 并行基础分数、轻量顺序修正与置信前缀 | [INF-PARALLEL-DRAFTING](../../02_PyTorch_Algorithms/INF-PARALLEL-DRAFTING_DFlash_and_DSpark.md) | [直达](../../02_PyTorch_Algorithms/INF-PARALLEL-DRAFTING_DFlash_and_DSpark.md#cheatsheet) |
+| dynamic proposal budget | 按历史调整预算，并比较额外成本 | [INF-PROPOSAL](../../02_PyTorch_Algorithms/INF-PROPOSAL_Dynamic_Proposal_and_Verification_Budget.md) | [直达](../../02_PyTorch_Algorithms/INF-PROPOSAL_Dynamic_Proposal_and_Verification_Budget.md#cheatsheet) |
+
+## 结果与项目决策
 
 ![推理优化证据与决策流程](../../public/topic_discussion/inference_optimization/benchmark_decision_zh.svg)
 
@@ -72,29 +88,29 @@
 | `P99` | 长尾请求是否不稳定 | 只看平均值，忽略排队和调度 |
 | `peak memory` | 当前配置能否继续增加上下文或并发 | 显存接近上限时仍盲目加 batch |
 | `cache hit rate` | Prefix / Radix Cache 是否真的复用 | 只看 TTFT 变化就推断命中 |
-| `acceptance rate` | speculative decoding 是否减少了验证成本 | 只看生成速度，不检查质量和接受率 |
+| `acceptance rate` | 提出的候选中有多少被接受 | 接受率高不等于成本低或端到端加速 |
 
-| 证据层级 | 可以确认什么 | 不能确认什么 |
+| 验证方式 | 可以确认什么 | 不能确认什么 |
 |:---|:---|:---|
 | CPU 模拟 | shape、容量公式、匹配逻辑和决策逻辑 | 真实显存、TTFT、吞吐和 backend 命中 |
 | 单卡机制实验 | 真实模型的局部显存、延迟和路径差异 | 完整 Serving 调度与稳定吞吐 |
 | backend 能力预检 | 服务能否启动、模型能否加载、指标能否采集 | 稳定 benchmark 与普遍结论 |
-| repeated benchmark | 固定 workload 下的相对收益 | 其他模型或 workload 的普遍收益 |
+| repeated benchmark | 相同 workload 下的相对收益 | 其他模型或 workload 的普遍收益 |
 
-`66` 负责建立浮点推理 baseline 和统一指标口径；`68–71` 分别验证投机解码、缓存复用、调度和架构扩展。任何候选方案都应在固定模型、backend、dtype、prompt / generated tokens、并发和请求分布下比较。
+`66` 负责建立浮点推理 baseline 和统一指标定义；`68–71` 分别验证投机解码、缓存复用、调度和架构扩展。任何候选方案都应在相同模型、backend、dtype、prompt / generated tokens、并发和请求分布下比较。
 
 形成结论时按以下顺序检查：
 
 1. **先定位阶段。** 先区分 prefill、decode、cache 和 serving 调度，不要用一个总延迟替代阶段指标。
 2. **再定位对象。** 说明瓶颈来自计算、访存、缓存容量、排队还是模型加载路径。
 3. **再选择策略。** 写清楚代价转移到了算力、带宽、显存、通信、排队延迟还是质量。
-4. **最后选择证据。** CPU 只能验证 shape、容量公式和决策逻辑；真实 TTFT、TPOT、P99、吞吐和 backend 行为需要 GPU 实验。
+4. **最后选择验证方式。** CPU 只能验证 shape、容量公式和决策逻辑；真实 TTFT、TPOT、P99、吞吐和 backend 行为需要 GPU 实验。
 
 使用 `accept / tune / reject` 时，必须同时考虑速度、显存、质量和稳定性。单次能力预检或单一指标改善只能标记为待验证，不能写成完整推理优化结论。
 
 ## 阅读入口
 
-- 想按顺序学习机制：回到[推理优化入口](./intro.md)，再读 01–07 正文。
+- 想按顺序学习机制：回到[推理优化入口](./intro.md)，再读 01–08 正文。
 - 想沿请求生命周期完整阅读：查看[推理优化深入阅读](./walkthrough.md)。
 - 想分析 KV Cache 的容量、复用和预算：转到[性能优化 Task3](../performance_optimization/intro.md)。
 - 想分析低比特表示和部署格式：转到[量化与压缩](../quantization_compression/intro.md)。
